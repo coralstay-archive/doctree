@@ -1,0 +1,21 @@
+# Secrets
+.env
+credentials.json
+token.json
+client_secret*.json
+.drive_sync_token
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Pipeline data / test output
+data/
+tmp_output/
+
+# IDE / OS
+.idea/
+.DS_Store
