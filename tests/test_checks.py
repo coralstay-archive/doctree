@@ -53,5 +53,34 @@ class TestExactDuplicates(unittest.TestCase):
         self.assertEqual(checks.find_exact_duplicates(recs), [])
 
 
+class TestSameTitleDifferentContent(unittest.TestCase):
+    def test_kbi_5_2_same_title_key_different_md5(self):
+        """KBI-5#2 제목 키가 같지만 MD5가 다른 묶음을 '동명 다른 파일'로 보고한다."""
+        recs = [
+            _rec("a", "Clean Code.pdf", md5="p"),
+            _rec("b", "Copy of clean-code.PDF", folder="백업", md5="q"),
+            _rec("c", "리팩터링.pdf", md5="r"),
+        ]
+        ws = checks.find_same_title_different_content(recs)
+        self.assertEqual(len(ws), 1)
+        self.assertEqual(ws[0].kind, "same_title_different_content")
+        self.assertEqual(sorted(_ids(ws[0])), ["a", "b"])
+        self.assertIn("동명 다른 파일", ws[0].message)
+
+    def test_kbi_5_2_all_same_md5_is_exact_duplicate_only(self):
+        """KBI-5#2 묶음 전체가 MD5 하나를 공유하면 완전 중복(#1)으로만 보고한다."""
+        recs = [_rec("a", "클린코드.pdf", md5="x"),
+                _rec("b", "클린 코드.pdf", folder="백업", md5="x")]
+        self.assertEqual(checks.find_same_title_different_content(recs), [])
+
+    def test_kbi_5_2_mixed_group_reported_whole(self):
+        """KBI-5#2 MD5 값이 2종 이상인 묶음은 묶음 전체를 보고한다."""
+        recs = [_rec("a", "클린코드.pdf", md5="x"),
+                _rec("b", "클린코드.pdf", folder="백업", md5="x"),
+                _rec("c", "클린코드.pdf", folder="기타", md5="y")]
+        ws = checks.find_same_title_different_content(recs)
+        self.assertEqual([sorted(_ids(w)) for w in ws], [["a", "b", "c"]])
+
+
 if __name__ == "__main__":
     unittest.main()

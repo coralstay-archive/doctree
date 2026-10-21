@@ -7,6 +7,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List
 
+from src.classify import title_key
+
 Record = Dict
 
 
@@ -49,5 +51,27 @@ def find_exact_duplicates(records: Iterable[Record]) -> List[CheckWarning]:
             kind="exact_duplicate",
             files=files,
             message=f"완전 중복 {len(files)}개 (MD5 동일): {_paths(files)}",
+        ))
+    return sorted(warnings, key=lambda w: _path(w.files[0]))
+
+
+def find_same_title_different_content(records: Iterable[Record]) -> List[CheckWarning]:
+    """제목 키가 같지만 MD5 값이 2종 이상인 묶음마다 '동명 다른 파일' 경고.
+
+    묶음 전체가 MD5 하나를 공유하면 완전 중복(find_exact_duplicates)으로만 보고한다.
+    MD5가 빈 파일은 내용을 알 수 없으므로 별도 값('')으로 센다.
+    """
+    groups: Dict[str, List[Record]] = defaultdict(list)
+    for rec in records:
+        groups[title_key(rec.get("name") or "")].append(rec)
+    warnings = []
+    for members in groups.values():
+        if len(members) < 2 or len({m.get("md5") or "" for m in members}) < 2:
+            continue
+        files = _sorted(members)
+        warnings.append(CheckWarning(
+            kind="same_title_different_content",
+            files=files,
+            message=f"동명 다른 파일 {len(files)}개 (제목 같고 MD5 다름): {_paths(files)}",
         ))
     return sorted(warnings, key=lambda w: _path(w.files[0]))
