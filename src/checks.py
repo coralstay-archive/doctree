@@ -27,6 +27,10 @@ def _path(rec: Record) -> str:
     return f"{folder}/{name}" if folder else name
 
 
+def _order(w: "CheckWarning"):
+    return (_path(w.files[0]), w.files[0].get("id") or "")
+
+
 def _sorted(recs: Iterable[Record]) -> List[Record]:
     return sorted(recs, key=lambda r: (_path(r), r.get("id") or ""))
 
@@ -52,7 +56,7 @@ def find_exact_duplicates(records: Iterable[Record]) -> List[CheckWarning]:
             files=files,
             message=f"완전 중복 {len(files)}개 (MD5 동일): {_paths(files)}",
         ))
-    return sorted(warnings, key=lambda w: _path(w.files[0]))
+    return sorted(warnings, key=_order)
 
 
 def find_same_title_different_content(records: Iterable[Record]) -> List[CheckWarning]:
@@ -74,7 +78,7 @@ def find_same_title_different_content(records: Iterable[Record]) -> List[CheckWa
             files=files,
             message=f"동명 다른 파일 {len(files)}개 (제목 같고 MD5 다름): {_paths(files)}",
         ))
-    return sorted(warnings, key=lambda w: _path(w.files[0]))
+    return sorted(warnings, key=_order)
 
 
 _FILENAME_KINDS = ("missing_pdf_extension", "copy_of_prefix", "surrounding_whitespace")
@@ -103,5 +107,15 @@ def find_filename_issues(records: Iterable[Record]) -> List[CheckWarning]:
                 message=f"파일명 앞뒤에 공백이 있음: {path!r}"))
     warnings: List[CheckWarning] = []
     for kind in _FILENAME_KINDS:
-        warnings.extend(sorted(found[kind], key=lambda w: _path(w.files[0])))
+        warnings.extend(sorted(found[kind], key=_order))
     return warnings
+
+
+def run_checks(records: Iterable[Record]) -> List[CheckWarning]:
+    """모든 점검을 실행해 종류 순(완전 중복 → 동명 다른 파일 → 파일명 점검) → 경로 순 경고 목록을 반환한다."""
+    records = list(records)
+    return (
+        find_exact_duplicates(records)
+        + find_same_title_different_content(records)
+        + find_filename_issues(records)
+    )

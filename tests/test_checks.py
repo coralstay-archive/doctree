@@ -1,5 +1,9 @@
 """중복·파일명 점검 (KBI-5)."""
+import copy
+import inspect
+import types
 import unittest
+from unittest import mock
 
 from src import checks
 
@@ -112,6 +116,61 @@ class TestFilenameChecks(unittest.TestCase):
         for w in ws:
             self.assertEqual(w.files, [rec])
             self.assertIn("IT/개발/Copy of 클린코드", w.message)
+
+
+class TestRunChecks(unittest.TestCase):
+    def _records(self):
+        return [
+            _rec("a", "클린코드.pdf", md5="x"),
+            _rec("b", "다른이름.pdf", folder="백업", md5="x"),
+            _rec("c", "리팩터링.pdf", md5="p"),
+            _rec("d", "리팩터링.pdf", folder="백업", md5="q"),
+            _rec("e", "Copy of 테스트주도개발", md5="t"),
+            _rec("f", " 객체지향.pdf", md5="u"),
+        ]
+
+    def test_kbi_5_4_structured_list_in_kind_order(self):
+        """KBI-5#4 종류·대상 파일·메시지를 가진 경고 목록을 종류 순 → 경로 순으로 반환한다."""
+        ws = checks.run_checks(self._records())
+        self.assertTrue(all(isinstance(w, checks.CheckWarning) for w in ws))
+        self.assertEqual(
+            [(w.kind, _ids(w)) for w in ws],
+            [
+                ("exact_duplicate", ["a", "b"]),
+                ("same_title_different_content", ["c", "d"]),
+                ("missing_pdf_extension", ["e"]),
+                ("copy_of_prefix", ["e"]),
+                ("surrounding_whitespace", ["f"]),
+            ],
+        )
+        for w in ws:
+            self.assertIsInstance(w.kind, str)
+            self.assertIsInstance(w.files, list)
+            self.assertTrue(w.message)
+        self.assertEqual(checks.run_checks(list(reversed(self._records()))), ws)
+
+    def test_kbi_5_4_empty_records(self):
+        """KBI-5#4 레코드가 없으면 빈 목록."""
+        self.assertEqual(checks.run_checks([]), [])
+
+    def test_kbi_5_b2_does_not_mutate_records(self):
+        """KBI-5#B2 점검은 입력 레코드를 수정하지 않는다."""
+        recs = self._records()
+        before = copy.deepcopy(recs)
+        checks.run_checks(recs)
+        self.assertEqual(recs, before)
+
+    def test_kbi_5_b2_never_touches_drive_api(self):
+        """KBI-5#B2 점검은 드라이브 API를 호출하지 않는다(경고만 만든다)."""
+        src = inspect.getsource(checks)
+        self.assertNotIn("googleapiclient", src)
+        self.assertNotIn("google_drive", src)
+        for value in vars(checks).values():
+            if isinstance(value, types.ModuleType):
+                self.assertFalse(value.__name__.startswith(("googleapiclient", "src.google_drive")))
+        with mock.patch("googleapiclient.discovery.build") as build:
+            checks.run_checks(self._records())
+        build.assert_not_called()
 
 
 if __name__ == "__main__":
