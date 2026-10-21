@@ -1,16 +1,19 @@
 ---
-id: DRAFT-6
+id: KBI-6
 title: 대장 렌더링과 kb-index update 명령
-status: Draft
+status: To Do
 assignee: []
 created_date: '2026-10-21 09:37'
-updated_date: '2026-10-21 09:37'
+updated_date: '2026-10-21 09:39'
 labels:
   - ledger
 dependencies:
-  - DRAFT-3
-  - DRAFT-4
-  - DRAFT-5
+  - KBI-3
+  - KBI-4
+  - KBI-5
+references:
+  - decision-1
+  - decision-2
 ---
 
 ## Description

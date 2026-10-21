@@ -1,14 +1,17 @@
 ---
-id: DRAFT-2
+id: KBI-2
 title: Drive 조회 모듈을 목록 전용으로 정리
-status: Draft
+status: To Do
 assignee: []
 created_date: '2026-10-21 09:37'
-updated_date: '2026-10-21 09:37'
+updated_date: '2026-10-21 09:39'
 labels:
   - drive
 dependencies:
-  - DRAFT-1
+  - KBI-1
+references:
+  - decision-1
+  - decision-2
 ---
 
 ## Description

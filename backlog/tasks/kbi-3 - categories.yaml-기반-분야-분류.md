@@ -1,14 +1,19 @@
 ---
-id: DRAFT-3
+id: KBI-3
 title: categories.yaml 기반 분야 분류
-status: Draft
+status: To Do
 assignee: []
 created_date: '2026-10-21 09:37'
-updated_date: '2026-10-21 09:37'
+updated_date: '2026-10-21 09:39'
 labels:
   - classify
 dependencies:
-  - DRAFT-2
+  - KBI-2
+references:
+  - decision-1
+documentation:
+  - 'local:도서목록-분류.md (2026-10-21 수동 분류본'
+  - 16분야 원본)
 ---
 
 ## Description

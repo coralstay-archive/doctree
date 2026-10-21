@@ -1,15 +1,17 @@
 ---
-id: DRAFT-5
+id: KBI-5
 title: 중복·파일명 점검
-status: Draft
+status: To Do
 assignee: []
 created_date: '2026-10-21 09:37'
-updated_date: '2026-10-21 09:37'
+updated_date: '2026-10-21 09:39'
 labels:
   - checks
 dependencies:
-  - DRAFT-2
-  - DRAFT-3
+  - KBI-2
+  - KBI-3
+references:
+  - decision-1
 ---
 
 ## Description

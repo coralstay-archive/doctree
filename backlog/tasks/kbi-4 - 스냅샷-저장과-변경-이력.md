@@ -1,14 +1,16 @@
 ---
-id: DRAFT-4
+id: KBI-4
 title: 스냅샷 저장과 변경 이력
-status: Draft
+status: To Do
 assignee: []
 created_date: '2026-10-21 09:37'
-updated_date: '2026-10-21 09:37'
+updated_date: '2026-10-21 09:39'
 labels:
   - ledger
 dependencies:
-  - DRAFT-2
+  - KBI-2
+references:
+  - decision-1
 ---
 
 ## Description

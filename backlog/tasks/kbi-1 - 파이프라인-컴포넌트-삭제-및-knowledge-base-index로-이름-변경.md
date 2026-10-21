@@ -1,13 +1,16 @@
 ---
-id: DRAFT-1
+id: KBI-1
 title: 파이프라인 컴포넌트 삭제 및 knowledge-base-index로 이름 변경
-status: Draft
+status: To Do
 assignee: []
 created_date: '2026-10-21 09:36'
-updated_date: '2026-10-21 09:37'
+updated_date: '2026-10-21 09:39'
 labels:
   - cleanup
 dependencies: []
+references:
+  - decision-1
+  - decision-2
 ---
 
 ## Description
