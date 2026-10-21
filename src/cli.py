@@ -105,9 +105,9 @@ def cmd_update(args: argparse.Namespace) -> int:
         f"미분류 {unclassified}권 · 경고 {len(warnings)}건"
     )
     console.print(f"🔄 최근 변경: {change_summary(run)}")
-    console.print(f"📄 대장: {ledger_path}")
-    console.print(f"🕘 변경 이력: {run.changelog_path}")
-    console.print(f"🗂️ 스냅샷: {run.snapshot_path}")
+    console.print(f"📄 대장: {ledger_path}", soft_wrap=True)
+    console.print(f"🕘 변경 이력: {run.changelog_path}", soft_wrap=True)
+    console.print(f"🗂️ 스냅샷: {run.snapshot_path}", soft_wrap=True)
     return 0
 
 

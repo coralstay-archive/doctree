@@ -123,6 +123,15 @@ class TestUpdateCommand(UpdateTestBase):
         self.assertIn("도서목록.md", flat)
         self.assertIn("변경이력.md", flat)
 
+    def test_kbi_6_1_output_paths_not_wrapped(self):
+        """KBI-6#1 좁은 터미널에서도 출력 경로가 줄바꿈으로 잘리지 않아 복사할 수 있다."""
+        out = io.StringIO()
+        with patch("src.cli.build_drive", return_value=self._drive()), \
+                patch("src.cli.console", Console(file=out, width=30, color_system=None)):
+            self.assertEqual(cli.main(["update", "--ledger-dir", str(self.ledger)]), 0)
+        self.assertIn(str(self.ledger / "도서목록.md"), out.getvalue())
+        self.assertIn(str(self.ledger / "변경이력.md"), out.getvalue())
+
     def test_kbi_6_1_second_run_reports_no_changes(self):
         """KBI-6#1 같은 목록으로 다시 돌리면 '변경 없음'으로 요약한다."""
         self.run_update(self._drive())
