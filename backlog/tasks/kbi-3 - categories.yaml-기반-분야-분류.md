@@ -1,10 +1,10 @@
 ---
 id: KBI-3
 title: categories.yaml 기반 분야 분류
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-21 09:37'
-updated_date: '2026-10-21 09:39'
+updated_date: '2026-10-21 10:02'
 labels:
   - classify
 dependencies:
