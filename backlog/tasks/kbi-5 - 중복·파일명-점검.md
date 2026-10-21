@@ -1,10 +1,10 @@
 ---
 id: KBI-5
 title: 중복·파일명 점검
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-21 09:37'
-updated_date: '2026-10-21 09:39'
+updated_date: '2026-10-21 13:56'
 labels:
   - checks
 dependencies:
