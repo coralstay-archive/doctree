@@ -1,10 +1,10 @@
 ---
 id: KBI-2
 title: Drive 조회 모듈을 목록 전용으로 정리
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-21 09:37'
-updated_date: '2026-10-21 09:39'
+updated_date: '2026-10-21 09:54'
 labels:
   - drive
 dependencies:
