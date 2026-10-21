@@ -28,6 +28,10 @@ PDF_MIME = 'application/pdf'
 LIST_FIELDS = 'nextPageToken, files(id, name, mimeType, parents, size, md5Checksum, modifiedTime, webViewLink)'
 
 
+class DriveListError(RuntimeError):
+    """드라이브 목록 조회(files.list) 실패. 빈 목록으로 삼키면 빈 대장이 써질 수 있어 예외로 올린다."""
+
+
 def normalize_str(text: str) -> str:
     """한글 자모 분리(NFD) 현상을 표준 완성형(NFC)으로 정규화합니다."""
     return unicodedata.normalize('NFC', text) if text else ""
@@ -180,6 +184,9 @@ class GoogleDriveManager:
 
         레코드 키: id, name, folder_path, size_bytes(int), md5(str, 없으면 ""),
         modified_time(Drive RFC3339 문자열), web_view_link. (folder_path, name) 순 정렬.
+
+        서비스가 없으면(인증 실패) 빈 목록을 돌려준다(호출 측이 drive.service로 먼저 확인).
+        API 호출이 실패하면 DriveListError를 낸다 — 빈 목록과 구별해 빈 대장을 막기 위함(KBI-6#B2).
         """
         if not self.service:
             print("[GoogleDriveManager] 구글 드라이브 서비스가 활성화되지 않았습니다 (자격 증명 파일 확인 필요).")
@@ -188,8 +195,7 @@ class GoogleDriveManager:
         try:
             all_items = self._list_all_items()
         except Exception as e:
-            print(f"[GoogleDriveManager] 파일 목록 조회 실패: {e}")
-            return []
+            raise DriveListError(f"구글 드라이브 파일 목록 조회 실패: {e}") from e
 
         folders_map: Dict[str, dict] = {
             item['id']: {'name': normalize_str(item.get('name', '')), 'parents': item.get('parents') or []}
