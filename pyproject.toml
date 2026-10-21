@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gdrive-book-markdown-pipeline"
+name = "knowledge-base-index"
 version = "0.1.0"
-description = "GDrive Book Markdown Pipeline: 400 DPI Book PDF to Markdown with TOC Indexing, Validation and LLM Summaries"
+description = "구글 드라이브 도서 PDF 목록 대장 생성 CLI"
 readme = "README.md"
 authors = [{ name = "flynn", email = "coralstay3595@gmail.com" }]
 requires-python = ">=3.9"
@@ -24,11 +24,7 @@ dev = [
 ]
 
 [project.scripts]
-gdrive-book-markdown-pipeline = "src.cli:main"
-gdrive-md = "src.cli:main"
-book2md = "src.cli:main"
-pdf2md = "src.cli:main"
+kb-index = "src.cli:main"
 
 [tool.setuptools]
 packages = ["src", "config"]
-py-modules = ["main", "auth_login"]

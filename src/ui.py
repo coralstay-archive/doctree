@@ -13,39 +13,6 @@ from src.google_drive import GoogleDriveManager, normalize_str
 console = Console()
 
 
-def print_local_status(
-    input_dir: Path,
-    temp_dir: Path,
-    failed_dir: Path,
-    output_dir: Path
-):
-    """로컬 파이프라인 데이터 폴더 현황을 표로 출력합니다."""
-    def get_stats(folder: Path, pattern: str = "*"):
-        if not folder.exists():
-            return 0, 0.0
-        files = [f for f in folder.rglob(pattern) if f.is_file()]
-        total_size = sum(f.stat().st_size for f in files)
-        return len(files), total_size / (1024 * 1024)
-
-    in_count, in_size = get_stats(input_dir, "*.pdf")
-    temp_count, temp_size = get_stats(temp_dir, "*.md")
-    fail_count, fail_size = get_stats(failed_dir, "*.md")
-    out_count, out_size = get_stats(output_dir, "*.md")
-
-    table = Table(title="📁 [bold yellow]로컬 파이프라인 데이터 현황[/bold yellow]", show_header=True, header_style="bold green")
-    table.add_column("단계 / 디렉터리", style="cyan", width=25)
-    table.add_column("파일 수", justify="right", style="magenta")
-    table.add_column("총 용량 (MB)", justify="right", style="green")
-    table.add_column("경로", style="dim")
-
-    table.add_row("1단계: 원본 PDF (Input)", f"{in_count}개 도서", f"{in_size:.1f} MB", str(input_dir))
-    table.add_row("2단계: 임시 마크다운 (Temp)", f"{temp_count}개 파일", f"{temp_size:.1f} MB", str(temp_dir))
-    table.add_row("3단계: 격리 마크다운 (Failed)", f"{fail_count}개 파일", f"{fail_size:.1f} MB", str(failed_dir))
-    table.add_row("5단계: 최종 완성본 (Output)", f"{out_count}개 파일", f"{out_size:.1f} MB", str(output_dir))
-
-    console.print(table)
-
-
 def print_account_dashboard(account_info: Optional[dict]):
     """구글 계정 및 드라이브 스토리지 현황을 rich 대시보드로 출력합니다."""
     if not account_info:
