@@ -75,3 +75,33 @@ def find_same_title_different_content(records: Iterable[Record]) -> List[CheckWa
             message=f"동명 다른 파일 {len(files)}개 (제목 같고 MD5 다름): {_paths(files)}",
         ))
     return sorted(warnings, key=lambda w: _path(w.files[0]))
+
+
+_FILENAME_KINDS = ("missing_pdf_extension", "copy_of_prefix", "surrounding_whitespace")
+
+
+def find_filename_issues(records: Iterable[Record]) -> List[CheckWarning]:
+    """파일별 파일명 점검: .pdf 확장자 누락, 'Copy of ' 접두어, 앞뒤 공백.
+
+    결과는 종류(_FILENAME_KINDS 순서) → 경로 순으로 정렬한다.
+    """
+    found: Dict[str, List[CheckWarning]] = {k: [] for k in _FILENAME_KINDS}
+    for rec in records:
+        name = rec.get("name") or ""
+        path = _path(rec)
+        if not name.lower().endswith(".pdf"):
+            found["missing_pdf_extension"].append(CheckWarning(
+                kind="missing_pdf_extension", files=[rec],
+                message=f"파일명에 .pdf 확장자가 없음: {path}"))
+        if name.startswith("Copy of "):
+            found["copy_of_prefix"].append(CheckWarning(
+                kind="copy_of_prefix", files=[rec],
+                message=f"파일명에 'Copy of ' 접두어가 있음: {path}"))
+        if name != name.strip():
+            found["surrounding_whitespace"].append(CheckWarning(
+                kind="surrounding_whitespace", files=[rec],
+                message=f"파일명 앞뒤에 공백이 있음: {path!r}"))
+    warnings: List[CheckWarning] = []
+    for kind in _FILENAME_KINDS:
+        warnings.extend(sorted(found[kind], key=lambda w: _path(w.files[0])))
+    return warnings

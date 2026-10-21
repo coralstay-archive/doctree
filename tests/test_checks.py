@@ -82,5 +82,37 @@ class TestSameTitleDifferentContent(unittest.TestCase):
         self.assertEqual([sorted(_ids(w)) for w in ws], [["a", "b", "c"]])
 
 
+class TestFilenameChecks(unittest.TestCase):
+    def _kinds(self, name):
+        return [w.kind for w in checks.find_filename_issues([_rec("a", name)])]
+
+    def test_kbi_5_3_missing_pdf_extension(self):
+        """KBI-5#3 이름이 .pdf(대소문자 무시)로 끝나지 않으면 확장자 누락 경고."""
+        self.assertEqual(self._kinds("클린코드"), ["missing_pdf_extension"])
+        self.assertEqual(self._kinds("클린코드.PDF"), [])
+        self.assertEqual(self._kinds("클린코드.pdf"), [])
+
+    def test_kbi_5_3_copy_of_prefix(self):
+        """KBI-5#3 'Copy of '로 시작하는 이름은 접두어 경고."""
+        self.assertEqual(self._kinds("Copy of 클린코드.pdf"), ["copy_of_prefix"])
+        self.assertEqual(self._kinds("Copyof 클린코드.pdf"), [])
+
+    def test_kbi_5_3_surrounding_whitespace(self):
+        """KBI-5#3 이름 앞뒤 공백은 공백 경고."""
+        self.assertEqual(self._kinds(" 클린코드.pdf"), ["surrounding_whitespace"])
+        self.assertEqual(self._kinds("클린코드.pdf "),
+                         ["missing_pdf_extension", "surrounding_whitespace"])
+        self.assertEqual(self._kinds("클린 코드.pdf"), [])
+
+    def test_kbi_5_3_warning_carries_file_and_message(self):
+        """KBI-5#3 파일명 경고는 대상 파일 하나와 한국어 메시지를 가진다."""
+        rec = _rec("a", "Copy of 클린코드")
+        ws = checks.find_filename_issues([rec])
+        self.assertEqual([w.kind for w in ws], ["missing_pdf_extension", "copy_of_prefix"])
+        for w in ws:
+            self.assertEqual(w.files, [rec])
+            self.assertIn("IT/개발/Copy of 클린코드", w.message)
+
+
 if __name__ == "__main__":
     unittest.main()
