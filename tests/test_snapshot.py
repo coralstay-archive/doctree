@@ -6,7 +6,16 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 
-from src.snapshot import Change, Changes, diff_snapshots, load_latest_snapshot, save_snapshot
+from src.snapshot import (
+    CHANGELOG_FILENAME,
+    CHANGELOG_HEADER,
+    Change,
+    Changes,
+    append_changelog,
+    diff_snapshots,
+    load_latest_snapshot,
+    save_snapshot,
+)
 
 
 def _rec(id_, name, folder="IT/개발", md5="m", size=1):
@@ -181,6 +190,91 @@ class TestDiffSnapshots(unittest.TestCase):
         ch2 = diff_snapshots([], list(reversed(new)))
         self.assertEqual(ch1, ch2)
         self.assertEqual([r["name"] for r in ch1.added], ["가.pdf", "나.pdf"])
+
+
+class TestAppendChangelog(unittest.TestCase):
+    def setUp(self):
+        self.ledger = Path(tempfile.mkdtemp())
+        self.path = self.ledger / CHANGELOG_FILENAME
+
+    def _read(self):
+        return self.path.read_text(encoding="utf-8")
+
+    def test_kbi_4_3_filename(self):
+        """KBI-4#3 변경 이력 파일은 ledger/변경이력.md다."""
+        self.assertEqual(CHANGELOG_FILENAME, "변경이력.md")
+        out = append_changelog(self.ledger, datetime(2026, 10, 21, 9, 30), Changes(), 3)
+        self.assertEqual(out, self.path)
+        self.assertTrue(self.path.is_file())
+
+    def test_kbi_4_3_no_changes_block(self):
+        """KBI-4#3 변경이 없으면 실행 시각·총 권수와 '변경 없음'을 기록한다."""
+        append_changelog(self.ledger, datetime(2026, 10, 21, 9, 30), Changes(), 3)
+        text = self._read()
+        self.assertTrue(text.startswith(CHANGELOG_HEADER))
+        self.assertIn("## 2026-10-21 09:30", text)
+        self.assertIn("총 3권", text)
+        self.assertIn("변경 없음", text)
+
+    def test_kbi_4_3_change_lines_grouped(self):
+        """KBI-4#3 변경은 종류별로 묶어 이름과 old→new를 보여 준다."""
+        ch = Changes(
+            added=[_rec("n", "새책.pdf", folder="IT/AI")],
+            removed=[_rec("r", "옛책.pdf", folder="경제")],
+            renamed=[Change("a", "B.pdf", "A.pdf", "B.pdf")],
+            moved=[Change("a", "B.pdf", "IT", "IT/개발")],
+            content_changed=[Change("c", "C.pdf", "x", "y")],
+        )
+        append_changelog(self.ledger, datetime(2026, 10, 21, 9, 30), ch, 10)
+        text = self._read()
+        self.assertNotIn("변경 없음", text)
+        order = ["### 추가 (1)", "IT/AI/새책.pdf", "### 삭제 (1)", "경제/옛책.pdf",
+                 "### 이름 변경 (1)", "A.pdf → B.pdf", "### 폴더 이동 (1)", "IT → IT/개발",
+                 "### 내용 변경 (1)", "C.pdf"]
+        positions = [text.index(t) for t in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("### ", text.split("### 추가")[0])  # 빈 종류는 제목도 없음
+
+    def test_kbi_4_3_empty_groups_omitted(self):
+        """KBI-4#3 해당 변경이 없는 종류는 출력하지 않는다."""
+        ch = Changes(renamed=[Change("a", "B.pdf", "A.pdf", "B.pdf")])
+        append_changelog(self.ledger, datetime(2026, 10, 21, 9, 30), ch, 1)
+        text = self._read()
+        self.assertIn("### 이름 변경 (1)", text)
+        for t in ("### 추가", "### 삭제", "### 폴더 이동", "### 내용 변경"):
+            self.assertNotIn(t, text)
+
+    def test_kbi_4_3_newest_on_top(self):
+        """KBI-4#3 새 실행 블록은 제목 바로 아래, 기존 블록보다 위에 들어간다."""
+        append_changelog(self.ledger, datetime(2026, 10, 20, 9, 0), Changes(), 1)
+        append_changelog(self.ledger, datetime(2026, 10, 21, 9, 0), Changes(), 2)
+        text = self._read()
+        self.assertTrue(text.startswith(CHANGELOG_HEADER + "## 2026-10-21 09:00"))
+        self.assertLess(text.index("2026-10-21"), text.index("2026-10-20"))
+        self.assertEqual(text.count(CHANGELOG_HEADER.strip()), 1)
+
+    def test_kbi_4_b3_existing_blocks_preserved_byte_for_byte(self):
+        """KBI-4#B3 이력은 누적되고 기존 블록은 바이트 그대로 새 블록 아래에 남는다."""
+        append_changelog(self.ledger, datetime(2026, 10, 19, 9, 0), Changes(), 1)
+        append_changelog(self.ledger, datetime(2026, 10, 20, 9, 0),
+                         Changes(added=[_rec("n", "새책.pdf")]), 2)
+        before = self.path.read_bytes()
+        body_before = before[len(CHANGELOG_HEADER.encode("utf-8")):]
+        append_changelog(self.ledger, datetime(2026, 10, 21, 9, 0),
+                         Changes(removed=[_rec("n", "새책.pdf")]), 1)
+        after = self.path.read_bytes()
+        self.assertTrue(after.endswith(body_before))
+        self.assertTrue(after.startswith(CHANGELOG_HEADER.encode("utf-8")))
+        self.assertGreater(len(after), len(before))
+
+    def test_kbi_4_b3_hand_edited_content_preserved(self):
+        """KBI-4#B3 제목이 없거나 손으로 고친 기존 내용도 지우지 않고 아래에 보존한다."""
+        legacy = "옛 메모\r\n- 손으로 쓴 줄\n"
+        self.path.write_bytes(legacy.encode("utf-8"))
+        append_changelog(self.ledger, datetime(2026, 10, 21, 9, 0), Changes(), 1)
+        after = self.path.read_bytes()
+        self.assertTrue(after.endswith(legacy.encode("utf-8")))
+        self.assertTrue(after.startswith(CHANGELOG_HEADER.encode("utf-8")))
 
 
 if __name__ == "__main__":

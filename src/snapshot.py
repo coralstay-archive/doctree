@@ -15,6 +15,8 @@ PathLike = Union[str, Path]
 Record = dict
 
 SNAPSHOT_DIRNAME = "snapshots"
+CHANGELOG_FILENAME = "변경이력.md"
+CHANGELOG_HEADER = "# 변경 이력\n\n"
 _SNAPSHOT_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2})\.json$")
 
 
@@ -135,3 +137,57 @@ def diff_snapshots(old_records: Iterable[Record], new_records: Iterable[Record])
     for lst in (ch.renamed, ch.moved, ch.content_changed):
         lst.sort(key=_change_sort_key)
     return ch
+
+
+def _display_path(r: Record) -> str:
+    folder = str(r.get("folder_path") or "")
+    name = str(r.get("name") or "")
+    return f"{folder}/{name}" if folder else name
+
+
+def render_changelog_block(run_at: datetime, changes: Changes, total: int) -> str:
+    """한 번의 실행을 나타내는 변경 이력 블록(마크다운)을 만든다. 끝은 줄바꿈 하나."""
+    lines = [f"## {run_at.strftime('%Y-%m-%d %H:%M')} · 총 {total}권", ""]
+    if changes.is_empty:
+        lines.append("- 변경 없음")
+    else:
+        groups = [
+            ("추가", [f"- {_display_path(r)}" for r in changes.added]),
+            ("삭제", [f"- {_display_path(r)}" for r in changes.removed]),
+            ("이름 변경", [f"- {c.old} → {c.new}" for c in changes.renamed]),
+            ("폴더 이동", [f"- {c.name}: {c.old or '(루트)'} → {c.new or '(루트)'}" for c in changes.moved]),
+            ("내용 변경", [f"- {c.name} ({c.old} → {c.new})" for c in changes.content_changed]),
+        ]
+        first = True
+        for title, items in groups:
+            if not items:
+                continue
+            if not first:
+                lines.append("")
+            lines.append(f"### {title} ({len(items)})")
+            lines.extend(items)
+            first = False
+    return "\n".join(lines) + "\n"
+
+
+def append_changelog(ledger_dir: PathLike, run_at: datetime, changes: Changes, total: int) -> Path:
+    """ledger_dir/변경이력.md의 제목 바로 아래에 이번 실행 블록을 끼워 넣는다.
+
+    기존 내용은 한 바이트도 고치지 않고 새 블록 아래에 그대로 둔다(B3).
+    파일이 고정 제목으로 시작하지 않으면(손으로 고친 경우 등) 제목+새 블록을 앞에 붙이고
+    기존 내용 전체를 그 아래에 보존한다.
+    """
+    path = Path(ledger_dir) / CHANGELOG_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = CHANGELOG_HEADER.encode("utf-8")
+    block = render_changelog_block(run_at, changes, total).encode("utf-8")
+    existing = path.read_bytes() if path.exists() else b""
+    if not existing:
+        data = header + block
+    else:
+        rest = existing[len(header):] if existing.startswith(header) else existing
+        data = header + block + b"\n" + rest
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+    return path
