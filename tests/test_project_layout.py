@@ -59,6 +59,25 @@ class TestDependenciesRemoved(unittest.TestCase):
             self.assertIn(dep, names)
 
 
+class TestRemainingCode(unittest.TestCase):
+    DELETED = ("converter", "validator", "summarizer", "main", "auth_login")
+
+    def test_kbi_1_5_no_imports_of_deleted_modules(self):
+        """KBI-1#5 남은 코드(src·config)가 삭제된 모듈을 import하지 않아 테스트가 깨지지 않는다."""
+        pattern = re.compile(
+            r"^\s*(?:from|import)\s+(?:src\.)?(%s)\b" % "|".join(self.DELETED), re.M
+        )
+        for path in list((ROOT / "src").rglob("*.py")) + list((ROOT / "config").rglob("*.py")):
+            self.assertIsNone(pattern.search(path.read_text()), str(path))
+
+    def test_kbi_1_5_all_modules_importable(self):
+        """KBI-1#5 남은 모듈은 모두 import된다."""
+        import importlib
+
+        for name in ("config.settings", "src.google_drive", "src.ui", "src.cli"):
+            importlib.import_module(name)
+
+
 class TestLedgerIgnored(unittest.TestCase):
     def test_kbi_1_4_gitignore_has_ledger(self):
         """KBI-1#4 KBI-1#B2 .gitignore에 ledger/가 있다."""
