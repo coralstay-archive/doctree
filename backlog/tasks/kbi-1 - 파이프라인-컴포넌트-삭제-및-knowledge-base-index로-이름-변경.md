@@ -1,10 +1,10 @@
 ---
 id: KBI-1
 title: 파이프라인 컴포넌트 삭제 및 knowledge-base-index로 이름 변경
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-21 09:36'
-updated_date: '2026-10-21 09:39'
+updated_date: '2026-10-21 09:42'
 labels:
   - cleanup
 dependencies: []
