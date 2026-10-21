@@ -1,10 +1,10 @@
 ---
 id: KBI-6
 title: 대장 렌더링과 doctree update 명령
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-10-21 09:37'
-updated_date: '2026-10-21 09:39'
+updated_date: '2026-10-21 13:58'
 labels:
   - ledger
 dependencies:
