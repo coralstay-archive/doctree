@@ -10,10 +10,10 @@ Drive 접근에는 OAuth 데스크톱 클라이언트(GCP 프로젝트 BookNotes
 
 ## Decision
 
-OAuth 동의 화면은 테스트 모드로 두고 본인 계정을 테스트 유저로 등록한다. `kb-index update`는 사람이 직접 실행하며, 주기 자동 실행은 하지 않는다. 범위는 `drive.readonly`만 쓴다.
+OAuth 동의 화면은 테스트 모드로 두고 본인 계정을 테스트 유저로 등록한다. `doctree update`는 사람이 직접 실행하며, 주기 자동 실행은 하지 않는다. 범위는 `drive.readonly`만 쓴다.
 
 ## Consequences
 
-- 토큰이 7일마다 만료되므로 `token.json`을 지우고 `kb-index auth`로 다시 로그인해야 한다.
+- 토큰이 7일마다 만료되므로 `token.json`을 지우고 `doctree auth`로 다시 로그인해야 한다.
 - 무인 주기 실행이 필요해지면 서비스 계정(또는 프로덕션 게시)으로 바꾸는 별도 결정이 필요하다.
 - `credentials.json`과 `token.json`은 `.gitignore`로 커밋에서 제외한다.

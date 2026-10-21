@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gdrive-book-markdown-pipeline"
+name = "doctree"
 version = "0.1.0"
-description = "GDrive Book Markdown Pipeline: 400 DPI Book PDF to Markdown with TOC Indexing, Validation and LLM Summaries"
+description = "구글 드라이브 도서 PDF 목록 대장 생성 CLI"
 readme = "README.md"
 authors = [{ name = "flynn", email = "coralstay3595@gmail.com" }]
 requires-python = ">=3.9"
@@ -13,11 +13,6 @@ dependencies = [
     "google-api-python-client>=2.0.0",
     "google-auth-httplib2>=0.1.0",
     "google-auth-oauthlib>=1.0.0",
-    "pdfplumber>=0.10.0",
-    "langdetect>=1.0.9",
-    "openai>=1.0.0",
-    "httpx>=0.25.0",
-    "aiofiles>=23.0.0",
     "PyYAML>=6.0",
     "python-dotenv>=1.0.0",
     "rich>=13.0.0",
@@ -26,15 +21,10 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
 ]
 
 [project.scripts]
-gdrive-book-markdown-pipeline = "src.cli:main"
-gdrive-md = "src.cli:main"
-book2md = "src.cli:main"
-pdf2md = "src.cli:main"
+doctree = "src.cli:main"
 
 [tool.setuptools]
 packages = ["src", "config"]
-py-modules = ["main", "auth_login"]

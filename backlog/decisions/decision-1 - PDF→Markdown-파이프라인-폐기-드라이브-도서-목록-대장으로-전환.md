@@ -10,7 +10,9 @@ status: accepted
 
 ## Decision
 
-변환·검증·요약 파이프라인(converter, validator, summarizer, OpenAI 연동)을 삭제한다. 프로젝트를 Drive 메타데이터만 읽어 도서 목록 대장(제목·용량·드라이브 경로·링크·분야)을 만드는 CLI `kb-index`로 다시 쓴다. 저장소 이름은 `knowledge-base-index`(GitHub private)로 바꾼다. 함께 관리할 항목은 변경 이력(스냅샷 비교), 분야 분류, 중복 감지, 파일명 점검, 스토리지 현황이다. 독서 상태와 본문 요약은 범위에서 뺀다.
+변환·검증·요약 파이프라인(converter, validator, summarizer, OpenAI 연동)을 삭제한다. 프로젝트를 Drive 메타데이터만 읽어 도서 목록 대장(제목·용량·드라이브 경로·링크·분야)을 만드는 CLI `doctree`로 다시 쓴다. 저장소 이름은 `doctree`(GitHub private)로 바꾼다. 함께 관리할 항목은 변경 이력(스냅샷 비교), 분야 분류, 중복 감지, 파일명 점검, 스토리지 현황이다. 독서 상태와 본문 요약은 범위에서 뺀다.
+
+이름은 knowledge-base-index → booktree를 거쳐 2026-10-21 `doctree`로 확정했다(PDF 외 문서로 넓혀도 어울리는 이름).
 
 ## Consequences
 
