@@ -1,11 +1,8 @@
-import hashlib
-import io
 import json
 import os
-import time
 import unicodedata
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 try:
     from google.oauth2 import service_account
@@ -13,7 +10,6 @@ try:
     from google_auth_oauthlib.flow import InstalledAppFlow
     from google.auth.transport.requests import Request
     from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
     from googleapiclient.errors import HttpError
     GOOGLE_API_AVAILABLE = True
 except ImportError:
@@ -22,7 +18,6 @@ except ImportError:
     InstalledAppFlow = None
     Request = None
     build = None
-    MediaIoBaseDownload = None
     HttpError = None
     GOOGLE_API_AVAILABLE = False
 
@@ -43,31 +38,8 @@ def is_pdf_item(item: dict) -> bool:
     return item.get('mimeType') == PDF_MIME or (item.get('name') or '').lower().endswith('.pdf')
 
 
-def calculate_file_md5(file_path: Path) -> str:
-    """로컬 파일의 MD5 해시를 계산합니다."""
-    if not file_path.exists():
-        return ""
-    hash_md5 = hashlib.md5()
-    with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024 * 4), b""):
-            hash_md5.update(chunk)
-    return hash_md5.hexdigest()
-
-
-def is_valid_pdf_file(file_path: Path) -> bool:
-    """PDF 파일의 기본 무결성 검증 (0바이트 여부 및 %PDF- 매직 넘버 확인)"""
-    if not file_path.exists() or file_path.stat().st_size == 0:
-        return False
-    try:
-        with open(file_path, "rb") as f:
-            header = f.read(5)
-            return header.startswith(b"%PDF-")
-    except Exception:
-        return False
-
-
 class GoogleDriveManager:
-    """구글 드라이브 API 연동 (서비스 계정 및 OAuth 2.0 지원), 변경 감지 및 청크 단위 PDF 다운로더"""
+    """구글 드라이브 API 연동 (서비스 계정 및 OAuth 2.0 지원) 및 도서 PDF 메타데이터 목록 조회 (읽기 전용)"""
 
     def __init__(self, service_account_file: Optional[str] = None, folder_id: Optional[str] = None):
         self.service_account_file = service_account_file or os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
@@ -76,7 +48,6 @@ class GoogleDriveManager:
 
         self.folder_id = folder_id or os.getenv("GOOGLE_DRIVE_FOLDER_ID")
         self.token_file = Path(self.service_account_file).parent / "token.json" if self.service_account_file else Path("token.json")
-        self.sync_token_file = Path(self.service_account_file).parent / ".drive_sync_token" if self.service_account_file else Path(".drive_sync_token")
         self.service = None
 
         if GOOGLE_API_AVAILABLE:
@@ -159,66 +130,6 @@ class GoogleDriveManager:
         except Exception as e:
             print(f"[GoogleDriveManager] 계정 및 스토리지 정보 조회 실패: {e}")
             return None
-
-    def get_start_page_token(self) -> Optional[str]:
-        """변경 감지를 위한 시작 페이지 토큰을 가져옵니다 (changes.getStartPageToken)."""
-        if not self.service:
-            return None
-        try:
-            response = self.service.changes().getStartPageToken().execute()
-            token = response.get('startPageToken')
-            if token:
-                with open(self.sync_token_file, 'w', encoding='utf-8') as f:
-                    f.write(token)
-            return token
-        except Exception as e:
-            print(f"[GoogleDriveManager] 변경 시작 토큰 발급 실패: {e}")
-            return None
-
-    def check_changes(self) -> Tuple[List[dict], Optional[str]]:
-        """마지막 동기화 이후 드라이브에서 발생한 변경사항(신규 업로드/수정/삭제)을 감지합니다 (changes.list)."""
-        if not self.service:
-            return [], None
-
-        saved_token = None
-        if self.sync_token_file.exists():
-            try:
-                with open(self.sync_token_file, 'r', encoding='utf-8') as f:
-                    saved_token = f.read().strip()
-            except Exception:
-                pass
-
-        if not saved_token:
-            new_token = self.get_start_page_token()
-            return [], new_token
-
-        try:
-            changes = []
-            page_token = saved_token
-            new_start_token = None
-
-            while page_token:
-                response = self.service.changes().list(
-                    pageToken=page_token,
-                    spaces='drive',
-                    fields='nextPageToken, newStartPageToken, changes(fileId, removed, file(id, name, mimeType, md5Checksum, modifiedTime, trashed, parents, size))'
-                ).execute()
-
-                changes.extend(response.get('changes', []))
-                page_token = response.get('nextPageToken')
-                if 'newStartPageToken' in response:
-                    new_start_token = response['newStartPageToken']
-
-            if new_start_token:
-                with open(self.sync_token_file, 'w', encoding='utf-8') as f:
-                    f.write(new_start_token)
-
-            return changes, new_start_token
-        except Exception as e:
-            print(f"[GoogleDriveManager] 변경 감지 조회 실패: {e}")
-            # 토큰 만료 등의 경우 초기화
-            new_token = self.get_start_page_token()
-            return [], new_token
 
     def _list_all_items(self) -> List[dict]:
         """휴지통을 제외한 드라이브 항목(폴더·파일)을 페이지네이션으로 모두 수집한다."""
@@ -305,92 +216,3 @@ class GoogleDriveManager:
 
         records.sort(key=lambda r: (r['folder_path'], r['name']))
         return records
-
-    def download_new_pdfs(self, target_dir: str or Path, force_recheck_md5: bool = False) -> List[Path]:
-        """새로운 PDF 파일들을 드라이브 디렉토리 구조를 보존하여 청크 단위로 로컬에 다운로드합니다 (MD5 해시/크기 검증 지원)."""
-        target_path = Path(target_dir)
-        target_path.mkdir(parents=True, exist_ok=True)
-
-        downloaded_files: List[Path] = []
-        files = self.list_pdf_files()
-
-        for file_info in files:
-            file_id = file_info['id']
-            file_name = file_info['name']
-            relative_path = file_info.get('relative_path', file_name)
-            remote_md5 = file_info.get('md5Checksum', '')
-            remote_size = int(file_info['size']) if 'size' in file_info and file_info['size'] else None
-            file_dest = target_path / relative_path
-
-            # 하위 폴더가 있는 경우 디렉토리 자동 생성
-            file_dest.parent.mkdir(parents=True, exist_ok=True)
-
-            if file_dest.exists():
-                is_same = True
-                # 크기 및 무결성 1차 비교
-                if remote_size and file_dest.stat().st_size != remote_size:
-                    is_same = False
-                elif not is_valid_pdf_file(file_dest):
-                    print(f"[GoogleDriveManager] 기존 파일 손상 감지(재다운로드): {relative_path}")
-                    is_same = False
-                elif force_recheck_md5 and remote_md5:
-                    local_md5 = calculate_file_md5(file_dest)
-                    if local_md5 != remote_md5:
-                        is_same = False
-
-                if is_same:
-                    downloaded_files.append(file_dest)
-                    continue
-                else:
-                    print(f"[GoogleDriveManager] 변경 감지(재다운로드 필요): {relative_path}")
-
-            print(f"[GoogleDriveManager] 다운로드 시작: {relative_path} (ID: {file_id})")
-            part_dest = file_dest.with_suffix(file_dest.suffix + ".part")
-            
-            # 네트워크 불안정 대비 재시도 (최대 3회 지수 백오프)
-            max_retries = 3
-            download_success = False
-
-            for attempt in range(1, max_retries + 1):
-                try:
-                    request = self.service.files().get_media(fileId=file_id)
-                    with io.FileIO(str(part_dest), 'wb') as fh:
-                        downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024 * 10) # 10MB chunk
-                        done = False
-                        while not done:
-                            status, done = downloader.next_chunk()
-                            if status:
-                                print(f"  [{relative_path}] 진행률: {int(status.progress() * 100)}% (시도 {attempt}/{max_retries})")
-
-                    # 무결성 검증 후 원자적 이름 변경 (.part -> .pdf)
-                    if part_dest.exists() and is_valid_pdf_file(part_dest):
-                        if part_dest.exists():
-                            if file_dest.exists():
-                                file_dest.unlink()
-                            part_dest.rename(file_dest)
-                        download_success = True
-                        print(f"[GoogleDriveManager] 다운로드 및 무결성 검증 완료: {relative_path}")
-                        downloaded_files.append(file_dest)
-                        break
-                    else:
-                        print(f"[GoogleDriveManager] 경고: 다운로드된 파일이 유효한 PDF가 아닙니다 (시도 {attempt}/{max_retries})")
-                        if part_dest.exists():
-                            part_dest.unlink()
-                except Exception as e:
-                    print(f"[GoogleDriveManager] 다운로드 중 에러 발생 (시도 {attempt}/{max_retries}): {e}")
-                    if part_dest.exists():
-                        try:
-                            part_dest.unlink()
-                        except Exception:
-                            pass
-                    if attempt < max_retries:
-                        time.sleep(2 ** attempt)
-
-            if not download_success:
-                print(f"[GoogleDriveManager] ❌ 최종 다운로드 실패: {relative_path}")
-
-        # 시작 토큰 초기화 (최초 동기화 시점 기준)
-        if not self.sync_token_file.exists():
-            self.get_start_page_token()
-
-        return downloaded_files

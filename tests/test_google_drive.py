@@ -86,35 +86,6 @@ class TestGoogleDriveManager(unittest.TestCase):
         self.assertEqual(files[0]["name"], "클린코드.pdf")
         self.assertEqual(files[0]["folder_path"], "책들/책박스9번")
 
-    @patch.object(GoogleDriveManager, "list_pdf_files")
-    @patch("src.google_drive.MediaIoBaseDownload")
-    @patch("src.google_drive.is_valid_pdf_file", return_value=True)
-    def test_download_new_pdfs(self, mock_is_valid, mock_downloader_cls, mock_list):
-        mock_list.return_value = [
-            {"id": "file_1", "name": "book1.pdf"},
-            {"id": "file_2", "name": "book2.pdf"}
-        ]
-
-        # First file doesn't exist, second file already exists
-        existing_file = Path(self.temp_dir) / "book2.pdf"
-        existing_file.write_bytes(b"%PDF-1.4 dummy content")
-
-        mock_downloader_instance = MagicMock()
-        # next_chunk returns (status, done)
-        mock_status = MagicMock()
-        mock_status.progress.return_value = 1.0
-        mock_downloader_instance.next_chunk.return_value = (mock_status, True)
-        mock_downloader_cls.return_value = mock_downloader_instance
-
-        drive = GoogleDriveManager()
-        drive.service = MagicMock()
-
-        downloaded = drive.download_new_pdfs(self.temp_dir)
-
-        self.assertEqual(len(downloaded), 2)
-        self.assertTrue((Path(self.temp_dir) / "book1.pdf").exists())
-        self.assertTrue((Path(self.temp_dir) / "book2.pdf").exists())
-
     def test_get_account_and_quota(self):
         drive = GoogleDriveManager()
         mock_service = MagicMock()
@@ -133,36 +104,6 @@ class TestGoogleDriveManager(unittest.TestCase):
         self.assertEqual(account["limit_gb"], 100.0)
         self.assertEqual(account["usage_gb"], 50.0)
         self.assertEqual(account["usage_percent"], 50.0)
-
-    def test_check_changes(self):
-        drive = GoogleDriveManager()
-        mock_service = MagicMock()
-        mock_start_token_req = MagicMock()
-        mock_start_token_req.execute.return_value = {"startPageToken": "token_123"}
-        mock_service.changes.return_value.getStartPageToken.return_value = mock_start_token_req
-
-        mock_changes_req = MagicMock()
-        mock_changes_req.execute.return_value = {
-            "changes": [
-                {"fileId": "file_new", "removed": False, "file": {"id": "file_new", "name": "new.pdf", "mimeType": "application/pdf"}}
-            ],
-            "newStartPageToken": "token_456"
-        }
-        mock_service.changes.return_value.list.return_value = mock_changes_req
-        drive.service = mock_service
-
-        # First call with no existing sync token
-        sync_token_path = Path(self.temp_dir) / ".drive_sync_token"
-        drive.sync_token_file = sync_token_path
-
-        changes, token = drive.check_changes()
-        self.assertEqual(token, "token_123")
-        self.assertEqual(changes, [])
-
-        # Second call with existing sync token
-        changes, next_token = drive.check_changes()
-        self.assertEqual(len(changes), 1)
-        self.assertEqual(next_token, "token_456")
 
 
 FOLDER = "application/vnd.google-apps.folder"
@@ -260,6 +201,37 @@ class TestRecordShape(unittest.TestCase):
             {"files": [{"id": "p2", "name": "p2.pdf", "mimeType": PDF, "parents": ["root_id"]}]},
         ])
         self.assertEqual([f["id"] for f in drive.list_pdf_files()], ["p1", "p2"])
+
+
+class TestListingOnly(unittest.TestCase):
+    """KBI-2#2 다운로드·Changes API·로컬 MD5 대조 코드 제거."""
+
+    SRC = Path(__file__).resolve().parent.parent / "src" / "google_drive.py"
+
+    def test_kbi_2_2_download_and_changes_api_removed(self):
+        """KBI-2#2 download_new_pdfs·get_start_page_token·check_changes·sync_token_file이 없다."""
+        for attr in ("download_new_pdfs", "get_start_page_token", "check_changes"):
+            self.assertFalse(hasattr(GoogleDriveManager, attr), attr)
+        drive = make_drive([])
+        self.assertFalse(hasattr(drive, "sync_token_file"))
+
+    def test_kbi_2_2_local_md5_helpers_removed(self):
+        """KBI-2#2 로컬 MD5 대조 헬퍼(calculate_file_md5·is_valid_pdf_file)가 없다."""
+        import src.google_drive as gd
+        for name in ("calculate_file_md5", "is_valid_pdf_file", "MediaIoBaseDownload"):
+            self.assertFalse(hasattr(gd, name), name)
+
+    def test_kbi_2_2_source_has_no_download_or_changes_calls(self):
+        """KBI-2#2 소스에 get_media·changes()·.drive_sync_token 참조가 남아 있지 않다."""
+        text = self.SRC.read_text()
+        for needle in ("get_media", "changes()", ".drive_sync_token", "MediaIoBaseDownload", "hashlib"):
+            self.assertNotIn(needle, text)
+
+    def test_kbi_2_2_auth_and_quota_kept(self):
+        """KBI-2#2 인증(_authenticate·token_file)과 get_account_and_quota는 유지된다."""
+        self.assertTrue(callable(getattr(GoogleDriveManager, "_authenticate", None)))
+        self.assertTrue(callable(getattr(GoogleDriveManager, "get_account_and_quota", None)))
+        self.assertEqual(make_drive([]).token_file.name, "token.json")
 
 
 if __name__ == "__main__":
