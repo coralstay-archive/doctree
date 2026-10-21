@@ -266,5 +266,64 @@ class TestSlashInFileName(unittest.TestCase):
         self.assertEqual(make_drive(items).list_pdf_files()[0]["folder_path"], "I/O")
 
 
+class TestScope(unittest.TestCase):
+    """KBI-2#4 KBI-2#B3 GOOGLE_DRIVE_FOLDER_ID 범위와 휴지통 제외."""
+
+    ITEMS = [
+        {"id": "f_kb", "name": "knowledge-base", "mimeType": FOLDER, "parents": ["root_id"]},
+        {"id": "f_raw", "name": "raw-data", "mimeType": FOLDER, "parents": ["f_kb"]},
+        {"id": "f_lang", "name": "어학", "mimeType": FOLDER, "parents": ["f_raw"]},
+        {"id": "f_other", "name": "Saved from Chrome", "mimeType": FOLDER, "parents": ["root_id"]},
+        {"id": "in_raw", "name": "raw.pdf", "mimeType": PDF, "parents": ["f_raw"]},
+        {"id": "in_lang", "name": "lang.pdf", "mimeType": PDF, "parents": ["f_lang"]},
+        {"id": "in_other", "name": "other.pdf", "mimeType": PDF, "parents": ["f_other"]},
+        {"id": "at_root", "name": "root.pdf", "mimeType": PDF, "parents": ["root_id"]},
+        {"id": "shared", "name": "shared.pdf", "mimeType": PDF, "parents": ["unknown_folder"]},
+        {"id": "orphan", "name": "orphan.pdf", "mimeType": PDF},
+    ]
+
+    def paths(self, folder_id):
+        return {f["id"]: f["folder_path"] for f in make_drive(self.ITEMS, folder_id=folder_id).list_pdf_files()}
+
+    def test_kbi_2_4_folder_id_limits_to_subtree(self):
+        """KBI-2#4 folder_id가 지정되면 그 폴더의 하위 트리만, 그 폴더 기준 상대 경로로 반환한다."""
+        self.assertEqual(self.paths("f_raw"), {"in_raw": "", "in_lang": "어학"})
+
+    def test_kbi_2_4_folder_id_excludes_unknown_parents(self):
+        """KBI-2#4 folder_id가 지정되면 부모를 알 수 없는 공유 항목·부모 없는 항목은 제외한다."""
+        paths = self.paths("f_kb")
+        self.assertEqual(paths, {"in_raw": "raw-data", "in_lang": "raw-data/어학"})
+
+    def test_kbi_2_4_whole_drive_when_folder_id_empty(self):
+        """KBI-2#4 folder_id가 비어 있으면(None·"") 드라이브 전체를 내 드라이브 루트 기준 경로로 반환한다."""
+        expected = {
+            "in_raw": "knowledge-base/raw-data",
+            "in_lang": "knowledge-base/raw-data/어학",
+            "in_other": "Saved from Chrome",
+            "at_root": "",
+            "shared": "",
+            "orphan": "",
+        }
+        self.assertEqual(self.paths(None), expected)
+        self.assertEqual(self.paths(""), expected)
+
+    def test_kbi_2_4_cyclic_parents_do_not_hang(self):
+        """KBI-2#4 폴더 부모 관계가 순환해도 무한 루프 없이 끝난다."""
+        items = [
+            {"id": "x", "name": "x", "mimeType": FOLDER, "parents": ["y"]},
+            {"id": "y", "name": "y", "mimeType": FOLDER, "parents": ["x"]},
+            {"id": "b", "name": "b.pdf", "mimeType": PDF, "parents": ["x"]},
+        ]
+        self.assertEqual(len(make_drive(items).list_pdf_files()), 1)
+        self.assertEqual(make_drive(items, folder_id="z").list_pdf_files(), [])
+
+    def test_kbi_2_b3_query_excludes_trashed(self):
+        """KBI-2#B3 KBI-2#4 files().list 쿼리 q에 trashed=false가 들어가 휴지통 파일을 제외한다."""
+        for folder_id in (None, "f_raw"):
+            drive = make_drive(self.ITEMS, folder_id=folder_id)
+            drive.list_pdf_files()
+            self.assertIn("trashed=false", list_kwargs(drive)["q"].replace(" ", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
