@@ -190,8 +190,23 @@ def _tree(cats) -> List[str]:
     return ["## 분류 트리", "", f"{fence}text"] + body + [fence, ""]
 
 
+def _link_text(text: str) -> str:
+    """링크 텍스트용: 역슬래시·'['·']'를 이스케이프한다."""
+    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def _link_target(url: str) -> str:
+    """링크 주소: 공백·괄호·'<>'가 있으면 퍼센트 인코딩한다."""
+    return "".join({" ": "%20", "(": "%28", ")": "%29", "<": "%3C", ">": "%3E"}.get(ch, ch) for ch in url)
+
+
 def _title_cell(rec: Record) -> str:
-    return cell(display_title(rec.get("name", "")))
+    """AC #3: 제목을 web_view_link로 연결한다. 링크가 없으면 제목만."""
+    title = _one_line(display_title(rec.get("name", "")))
+    link = _one_line(rec.get("web_view_link") or "").strip()
+    if not link:
+        return cell(title)
+    return cell(f"[{_link_text(title)}]({_link_target(link)})")
 
 
 def _details(cats, categories, file_warnings: Dict[str, List[str]]) -> List[str]:

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from src.checks import run_checks
 from src.classify import classify, load_categories
-from src.render import render_ledger
+from src.render import display_title, render_ledger
 from src.snapshot import Change, Changes, RunResult
 
 KST = timezone(timedelta(hours=9), "KST")
@@ -236,6 +236,41 @@ class TestEscaping(unittest.TestCase):
         text = render(records=[_rec("t", "a```b.pdf")], run=_run(total=1))
         tree = section(text, "분류 트리")
         self.assertIn("````text", tree)
+
+
+class TestTitleLinks(unittest.TestCase):
+    def setUp(self):
+        self.detail = section(render(), "분야별 상세")
+
+    def _row(self, needle):
+        return next(l for l in self.detail.splitlines() if needle in l and l.startswith("|"))
+
+    def test_kbi_6_3_display_title(self):
+        """KBI-6#3 표시 제목: 끝의 .pdf 제거, 하이픈 → 공백."""
+        self.assertEqual(display_title("종만북-1권.pdf"), "종만북 1권")
+        self.assertEqual(display_title("TLPI-1.PDF"), "TLPI 1")
+        self.assertEqual(display_title("a.pdf.bak"), "a.pdf.bak")
+
+    def test_kbi_6_3_title_links_to_web_view_link(self):
+        """KBI-6#3 상세 표의 제목은 web_view_link로 연결된 마크다운 링크다."""
+        row = self._row("종만북 1권")
+        self.assertTrue(row.startswith("| [종만북 1권](https://drive.google.com/file/d/a/view) |"), row)
+
+    def test_kbi_6_3_brackets_escaped(self):
+        """KBI-6#3 제목의 '['·']'는 이스케이프돼 링크 문법이 깨지지 않는다."""
+        row = self._row("대괄호")
+        self.assertIn("[\\[대괄호\\] 책](https://drive.google.com/file/d/f/view)", row)
+
+    def test_kbi_6_3_pipe_in_linked_title(self):
+        """KBI-6#3 KBI-6#B3 링크 제목 안의 '|'도 이스케이프된다."""
+        self.assertIn("[A\\|B 테스트](https://drive.google.com/file/d/d/view)", self._row("테스트"))
+
+    def test_kbi_6_3_no_link_falls_back_to_plain_title(self):
+        """KBI-6#3 web_view_link가 비어 있으면 제목만 쓴다."""
+        rec = dict(_rec("z", "링크없음.pdf"), web_view_link="")
+        detail = section(render(records=[rec], run=_run(total=1)), "분야별 상세")
+        row = next(l for l in detail.splitlines() if "링크없음" in l)
+        self.assertTrue(row.startswith("| 링크없음 |"), row)
 
 
 if __name__ == "__main__":
