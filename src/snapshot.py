@@ -145,10 +145,15 @@ def _display_path(r: Record) -> str:
     return f"{folder}/{name}" if folder else name
 
 
-def render_changelog_block(run_at: datetime, changes: Changes, total: int) -> str:
-    """한 번의 실행을 나타내는 변경 이력 블록(마크다운)을 만든다. 끝은 줄바꿈 하나."""
+def render_changelog_block(run_at: datetime, changes: Changes, total: int, first_run: bool = False) -> str:
+    """한 번의 실행을 나타내는 변경 이력 블록(마크다운)을 만든다. 끝은 줄바꿈 하나.
+
+    first_run이면 파일별 변경 없이 '최초 등록 N권'만 쓴다(AC #4).
+    """
     lines = [f"## {run_at.strftime('%Y-%m-%d %H:%M')} · 총 {total}권", ""]
-    if changes.is_empty:
+    if first_run:
+        lines.append(f"- 최초 등록 {total}권")
+    elif changes.is_empty:
         lines.append("- 변경 없음")
     else:
         groups = [
@@ -170,7 +175,9 @@ def render_changelog_block(run_at: datetime, changes: Changes, total: int) -> st
     return "\n".join(lines) + "\n"
 
 
-def append_changelog(ledger_dir: PathLike, run_at: datetime, changes: Changes, total: int) -> Path:
+def append_changelog(
+    ledger_dir: PathLike, run_at: datetime, changes: Changes, total: int, first_run: bool = False
+) -> Path:
     """ledger_dir/변경이력.md의 제목 바로 아래에 이번 실행 블록을 끼워 넣는다.
 
     기존 내용은 한 바이트도 고치지 않고 새 블록 아래에 그대로 둔다(B3).
@@ -180,7 +187,7 @@ def append_changelog(ledger_dir: PathLike, run_at: datetime, changes: Changes, t
     path = Path(ledger_dir) / CHANGELOG_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
     header = CHANGELOG_HEADER.encode("utf-8")
-    block = render_changelog_block(run_at, changes, total).encode("utf-8")
+    block = render_changelog_block(run_at, changes, total, first_run).encode("utf-8")
     existing = path.read_bytes() if path.exists() else b""
     if not existing:
         data = header + block
@@ -191,3 +198,34 @@ def append_changelog(ledger_dir: PathLike, run_at: datetime, changes: Changes, t
     tmp.write_bytes(data)
     tmp.replace(path)
     return path
+
+
+@dataclass
+class RunResult:
+    """record_run 결과. baseline_date는 비교 기준 스냅샷 날짜(최초 실행이면 None)."""
+
+    changes: Changes
+    total: int
+    first_run: bool
+    baseline_date: Optional[date]
+    snapshot_path: Path
+    changelog_path: Path
+
+
+def record_run(records: Iterable[Record], ledger_dir: PathLike, now: datetime) -> RunResult:
+    """한 번의 실행을 기록한다: 직전 스냅샷 읽기 → 비교 → 이력 블록 추가 → 스냅샷 저장.
+
+    비교 기준은 저장 전에 읽으므로 같은 날 앞선 실행이 남긴 오늘 스냅샷도 기준이 된다(B4).
+    직전 스냅샷이 없으면 '최초 등록 N권'으로 기록한다(AC #4).
+    """
+    recs = list(records)
+    prior = load_latest_snapshot(ledger_dir)
+    if prior is None:
+        changes, baseline = Changes(), None
+    else:
+        baseline, old = prior
+        changes = diff_snapshots(old, recs)
+    first_run = prior is None
+    changelog = append_changelog(ledger_dir, now, changes, len(recs), first_run=first_run)
+    snap = save_snapshot(recs, ledger_dir, now)
+    return RunResult(changes, len(recs), first_run, baseline, snap, changelog)

@@ -14,6 +14,7 @@ from src.snapshot import (
     append_changelog,
     diff_snapshots,
     load_latest_snapshot,
+    record_run,
     save_snapshot,
 )
 
@@ -275,6 +276,75 @@ class TestAppendChangelog(unittest.TestCase):
         after = self.path.read_bytes()
         self.assertTrue(after.endswith(legacy.encode("utf-8")))
         self.assertTrue(after.startswith(CHANGELOG_HEADER.encode("utf-8")))
+
+
+class TestFirstRun(unittest.TestCase):
+    def setUp(self):
+        self.ledger = Path(tempfile.mkdtemp())
+
+    def test_kbi_4_4_first_run_block(self):
+        """KBI-4#4 first_run이면 '최초 등록 N권'만 쓰고 파일별 변경 줄은 쓰지 않는다."""
+        ch = Changes(added=[_rec("a", "A.pdf"), _rec("b", "B.pdf")])
+        append_changelog(self.ledger, datetime(2026, 10, 21, 9, 0), ch, 2, first_run=True)
+        text = (self.ledger / CHANGELOG_FILENAME).read_text(encoding="utf-8")
+        self.assertIn("최초 등록 2권", text)
+        self.assertNotIn("A.pdf", text)
+        self.assertNotIn("###", text)
+        self.assertNotIn("변경 없음", text)
+
+    def test_kbi_4_4_record_run_without_prior_snapshot(self):
+        """KBI-4#4 직전 스냅샷이 없으면 record_run이 '최초 등록 N권'을 기록하고 스냅샷을 만든다."""
+        recs = [_rec("a", "A.pdf"), _rec("b", "B.pdf"), _rec("c", "C.pdf")]
+        res = record_run(recs, self.ledger, datetime(2026, 10, 21, 9, 0))
+        self.assertTrue(res.first_run)
+        self.assertIsNone(res.baseline_date)
+        self.assertEqual(res.total, 3)
+        self.assertTrue(res.changes.is_empty)
+        self.assertEqual(res.snapshot_path, self.ledger / "snapshots" / "2026-10-21.json")
+        self.assertTrue(res.snapshot_path.is_file())
+        text = (self.ledger / CHANGELOG_FILENAME).read_text(encoding="utf-8")
+        self.assertIn("최초 등록 3권", text)
+        self.assertNotIn("A.pdf", text)
+
+
+class TestRecordRun(unittest.TestCase):
+    def setUp(self):
+        self.ledger = Path(tempfile.mkdtemp())
+
+    def test_kbi_4_1_rerun_no_changes(self):
+        """KBI-4#1 같은 목록으로 같은 날 재실행하면 스냅샷은 덮어쓰고 이력에는 '변경 없음'."""
+        recs = [_rec("a", "A.pdf")]
+        record_run(recs, self.ledger, datetime(2026, 10, 21, 9, 0))
+        res = record_run(recs, self.ledger, datetime(2026, 10, 21, 18, 0))
+        self.assertFalse(res.first_run)
+        self.assertEqual(res.baseline_date, date(2026, 10, 21))
+        self.assertTrue(res.changes.is_empty)
+        self.assertEqual(len(list((self.ledger / "snapshots").iterdir())), 1)
+        text = (self.ledger / CHANGELOG_FILENAME).read_text(encoding="utf-8")
+        self.assertLess(text.index("18:00"), text.index("09:00"))
+        self.assertIn("변경 없음", text)
+
+    def test_kbi_4_b4_same_day_rerun_compares_with_earlier_run(self):
+        """KBI-4#B4 같은 날 재실행은 앞선 실행이 남긴 오늘 스냅샷과 비교한다(덮어쓰기 전에 읽음)."""
+        record_run([_rec("y", "Y.pdf")], self.ledger, datetime(2026, 10, 20, 9, 0))
+        record_run([_rec("y", "Y.pdf"), _rec("m", "M.pdf")], self.ledger, datetime(2026, 10, 21, 9, 0))
+        res = record_run([_rec("y", "Y.pdf"), _rec("m", "M.pdf"), _rec("e", "E.pdf")],
+                         self.ledger, datetime(2026, 10, 21, 18, 0))
+        self.assertEqual(res.baseline_date, date(2026, 10, 21))
+        self.assertEqual([r["id"] for r in res.changes.added], ["e"])  # m은 오전 실행에서 이미 기록됨
+        data = json.loads(res.snapshot_path.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(r["id"] for r in data["records"]), ["e", "m", "y"])
+
+    def test_kbi_4_2_record_run_writes_diff(self):
+        """KBI-4#2 record_run은 직전 스냅샷과의 차이를 이력에 기록한다."""
+        record_run([_rec("a", "A.pdf", folder="X"), _rec("b", "B.pdf")], self.ledger,
+                   datetime(2026, 10, 20, 9, 0))
+        res = record_run([_rec("a", "Z.pdf", folder="Y"), _rec("c", "C.pdf")], self.ledger,
+                         datetime(2026, 10, 21, 9, 0))
+        self.assertEqual(res.total, 2)
+        text = (self.ledger / CHANGELOG_FILENAME).read_text(encoding="utf-8")
+        for t in ("### 추가 (1)", "### 삭제 (1)", "A.pdf → Z.pdf", "X → Y"):
+            self.assertIn(t, text)
 
 
 if __name__ == "__main__":
