@@ -61,11 +61,12 @@ class TestGoogleDriveManager(unittest.TestCase):
         files = drive.list_pdf_files()
         self.assertEqual(len(files), 2)
         self.assertEqual(files[0]["name"], "book1.pdf")
-        self.assertEqual(files[0]["relative_path"], "book1.pdf")
+        self.assertEqual(files[0]["folder_path"], "")
         self.assertEqual(files[1]["id"], "file_2")
 
     def test_list_pdf_files_nested_folders(self):
         drive = GoogleDriveManager(folder_id=None) # 루트 전체 탐색
+        drive.folder_id = None  # .env의 GOOGLE_DRIVE_FOLDER_ID 영향 차단
         mock_service = MagicMock()
         mock_files_resource = MagicMock()
         mock_list_req = MagicMock()
@@ -83,7 +84,7 @@ class TestGoogleDriveManager(unittest.TestCase):
         files = drive.list_pdf_files()
         self.assertEqual(len(files), 1)
         self.assertEqual(files[0]["name"], "클린코드.pdf")
-        self.assertEqual(files[0]["relative_path"], "책들/책박스9번/클린코드.pdf")
+        self.assertEqual(files[0]["folder_path"], "책들/책박스9번")
 
     @patch.object(GoogleDriveManager, "list_pdf_files")
     @patch("src.google_drive.MediaIoBaseDownload")
@@ -162,6 +163,103 @@ class TestGoogleDriveManager(unittest.TestCase):
         changes, next_token = drive.check_changes()
         self.assertEqual(len(changes), 1)
         self.assertEqual(next_token, "token_456")
+
+
+FOLDER = "application/vnd.google-apps.folder"
+PDF = "application/pdf"
+
+
+def make_drive(items, folder_id=None, pages=None):
+    """Drive API service를 MagicMock으로 대체한 GoogleDriveManager를 만든다.
+
+    pages가 주어지면 files().list().execute()가 페이지별 응답을 차례로 돌려준다.
+    """
+    tmp = tempfile.mkdtemp()
+    drive = GoogleDriveManager(service_account_file=os.path.join(tmp, "none.json"))
+    shutil.rmtree(tmp, ignore_errors=True)
+    drive.folder_id = folder_id
+    service = MagicMock()
+    req = MagicMock()
+    if pages is not None:
+        req.execute.side_effect = pages
+    else:
+        req.execute.return_value = {"files": items}
+    service.files.return_value.list.return_value = req
+    drive.service = service
+    return drive
+
+
+def list_kwargs(drive):
+    """files().list() 첫 호출의 키워드 인자."""
+    return drive.service.files.return_value.list.call_args_list[0].kwargs
+
+
+class TestRecordShape(unittest.TestCase):
+    """KBI-2#1 목록 레코드 형태."""
+
+    ITEMS = [
+        {"id": "f_kb", "name": "knowledge-base", "mimeType": FOLDER, "parents": ["root_id"]},
+        {"id": "f_raw", "name": "raw-data", "mimeType": FOLDER, "parents": ["f_kb"]},
+        {
+            "id": "b2", "name": "\u1112\u1161\u11ab.pdf", "mimeType": PDF, "parents": ["f_raw"],
+            "size": "2048", "md5Checksum": "abc123", "modifiedTime": "2026-01-02T03:04:05.000Z",
+            "webViewLink": "https://drive.google.com/file/d/b2/view",
+        },
+        {"id": "b1", "name": "a.pdf", "mimeType": PDF, "parents": ["f_raw"]},
+        {"id": "b0", "name": "z.pdf", "mimeType": PDF, "parents": ["root_id"], "size": "1"},
+    ]
+
+    def test_kbi_2_1_record_has_exact_keys(self):
+        """KBI-2#1 레코드는 정확히 id·name·folder_path·size_bytes·md5·modified_time·web_view_link 키를 갖는다."""
+        files = make_drive(self.ITEMS).list_pdf_files()
+        self.assertEqual(len(files), 3)
+        for f in files:
+            self.assertEqual(
+                set(f.keys()),
+                {"id", "name", "folder_path", "size_bytes", "md5", "modified_time", "web_view_link"},
+            )
+
+    def test_kbi_2_1_record_values_and_types(self):
+        """KBI-2#1 size_bytes는 int, md5는 str(없으면 ""), modified_time은 Drive RFC3339 문자열 그대로, 이름은 NFC."""
+        files = {f["id"]: f for f in make_drive(self.ITEMS).list_pdf_files()}
+        b2 = files["b2"]
+        self.assertEqual(b2["name"], "한.pdf")
+        self.assertEqual(b2["folder_path"], "knowledge-base/raw-data")
+        self.assertEqual(b2["size_bytes"], 2048)
+        self.assertIsInstance(b2["size_bytes"], int)
+        self.assertEqual(b2["md5"], "abc123")
+        self.assertEqual(b2["modified_time"], "2026-01-02T03:04:05.000Z")
+        self.assertEqual(b2["web_view_link"], "https://drive.google.com/file/d/b2/view")
+        b1 = files["b1"]
+        self.assertEqual(b1["size_bytes"], 0)
+        self.assertEqual(b1["md5"], "")
+        self.assertEqual(b1["modified_time"], "")
+        self.assertEqual(b1["web_view_link"], "")
+
+    def test_kbi_2_1_requests_web_view_link_field(self):
+        """KBI-2#1 files().list fields에 webViewLink·md5Checksum·modifiedTime·size를 요청한다."""
+        drive = make_drive(self.ITEMS)
+        drive.list_pdf_files()
+        fields = list_kwargs(drive)["fields"]
+        for name in ("webViewLink", "md5Checksum", "modifiedTime", "size", "parents", "mimeType"):
+            self.assertIn(name, fields)
+
+    def test_kbi_2_1_sorted_by_folder_path_then_name(self):
+        """KBI-2#1 결과는 (folder_path, name) 순으로 결정적으로 정렬된다."""
+        files = make_drive(self.ITEMS).list_pdf_files()
+        self.assertEqual([(f["folder_path"], f["name"]) for f in files], [
+            ("", "z.pdf"),
+            ("knowledge-base/raw-data", "a.pdf"),
+            ("knowledge-base/raw-data", "한.pdf"),
+        ])
+
+    def test_kbi_2_1_paginates(self):
+        """KBI-2#1 nextPageToken을 따라 모든 페이지를 수집한다."""
+        drive = make_drive(None, pages=[
+            {"files": [{"id": "p1", "name": "p1.pdf", "mimeType": PDF, "parents": ["root_id"]}], "nextPageToken": "t2"},
+            {"files": [{"id": "p2", "name": "p2.pdf", "mimeType": PDF, "parents": ["root_id"]}]},
+        ])
+        self.assertEqual([f["id"] for f in drive.list_pdf_files()], ["p1", "p2"])
 
 
 if __name__ == "__main__":

@@ -28,10 +28,19 @@ except ImportError:
 
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
+FOLDER_MIME = 'application/vnd.google-apps.folder'
+PDF_MIME = 'application/pdf'
+LIST_FIELDS = 'nextPageToken, files(id, name, mimeType, parents, size, md5Checksum, modifiedTime, webViewLink)'
+
 
 def normalize_str(text: str) -> str:
     """한글 자모 분리(NFD) 현상을 표준 완성형(NFC)으로 정규화합니다."""
     return unicodedata.normalize('NFC', text) if text else ""
+
+
+def is_pdf_item(item: dict) -> bool:
+    """mimeType이 application/pdf이거나 이름이 .pdf로 끝나면(대소문자 무시) 도서 PDF로 본다."""
+    return item.get('mimeType') == PDF_MIME or (item.get('name') or '').lower().endswith('.pdf')
 
 
 def calculate_file_md5(file_path: Path) -> str:
@@ -211,99 +220,91 @@ class GoogleDriveManager:
             new_token = self.get_start_page_token()
             return [], new_token
 
+    def _list_all_items(self) -> List[dict]:
+        """휴지통을 제외한 드라이브 항목(폴더·파일)을 페이지네이션으로 모두 수집한다."""
+        all_items: List[dict] = []
+        page_token = None
+        while True:
+            response = self.service.files().list(
+                q="trashed=false",
+                spaces='drive',
+                pageSize=1000,
+                fields=LIST_FIELDS,
+                pageToken=page_token
+            ).execute()
+            all_items.extend(response.get('files', []))
+            page_token = response.get('nextPageToken')
+            if not page_token:
+                break
+        return all_items
+
+    def _resolve_folder_path(self, item: dict, folders_map: Dict[str, dict]) -> Optional[str]:
+        """파일의 상위 폴더 이름만 '/'로 이어 folder_path를 만든다 (파일명은 절대 쪼개지 않는다).
+
+        - folder_id 지정: 조상 체인이 folder_id에 닿아야 하며, 그 폴더 기준 상대 경로를 돌려준다
+          (바로 아래 파일은 ""). 닿지 않으면(상위가 폴더 맵에 없는 공유 항목 포함) None → 제외.
+        - folder_id 미지정: 내 드라이브 루트 기준 경로. 체인은 폴더 맵에 없는 부모(루트 또는 알 수 없는
+          공유 폴더)에서 멈추므로, 루트 파일과 부모를 알 수 없는 공유 항목은 "".
+        """
+        parents = item.get('parents') or []
+        curr = parents[0] if parents else None
+        parts: List[str] = []
+        visited: Set[str] = set()
+        while curr and curr not in visited:
+            if self.folder_id and curr == self.folder_id:
+                return '/'.join(reversed(parts))
+            folder = folders_map.get(curr)
+            if folder is None:
+                break
+            visited.add(curr)
+            parts.append(folder['name'])
+            folder_parents = folder.get('parents') or []
+            curr = folder_parents[0] if folder_parents else None
+        if self.folder_id:
+            return None
+        return '/'.join(reversed(parts))
+
     def list_pdf_files(self) -> List[dict]:
-        """최상위 디렉토리(또는 지정된 대상 폴더)부터 모든 하위 폴더를 누락 없이 탐색하여 상대 경로 및 MD5 해시가 포함된 PDF 파일 목록을 조회합니다."""
+        """도서 PDF 목록을 대장용 메타데이터 레코드로 반환한다.
+
+        레코드 키: id, name, folder_path, size_bytes(int), md5(str, 없으면 ""),
+        modified_time(Drive RFC3339 문자열), web_view_link. (folder_path, name) 순 정렬.
+        """
         if not self.service:
             print("[GoogleDriveManager] 구글 드라이브 서비스가 활성화되지 않았습니다 (자격 증명 파일 확인 필요).")
             return []
 
         try:
-            # 1. 전체 폴더 및 PDF 파일 목록을 페이지네이션으로 일괄 수집
-            all_items = []
-            page_token = None
-            while True:
-                response = self.service.files().list(
-                    q="trashed=false",
-                    spaces='drive',
-                    pageSize=1000,
-                    fields='nextPageToken, files(id, name, mimeType, parents, size, md5Checksum, modifiedTime)',
-                    pageToken=page_token
-                ).execute()
-                all_items.extend(response.get('files', []))
-                page_token = response.get('nextPageToken', None)
-                if not page_token:
-                    break
-
-            # 2. 폴더 맵 구성: id -> {'name': str, 'parents': list}
-            folders_map: Dict[str, dict] = {}
-            for item in all_items:
-                if item.get('mimeType') == 'application/vnd.google-apps.folder':
-                    folders_map[item['id']] = {
-                        'name': normalize_str(item.get('name', '')),
-                        'parents': item.get('parents', [])
-                    }
-
-            # 3. 만약 self.folder_id가 지정되어 있다면 대상 폴더의 모든 하위 자손 폴더 ID 식별
-            allowed_parent_ids: Optional[Set[str]] = None
-            if self.folder_id:
-                allowed_parent_ids = {self.folder_id}
-                changed = True
-                while changed:
-                    changed = False
-                    for fid, finfo in folders_map.items():
-                        if fid not in allowed_parent_ids:
-                            for p in finfo.get('parents', []):
-                                if p in allowed_parent_ids:
-                                    allowed_parent_ids.add(fid)
-                                    changed = True
-
-            # 4. 상대 경로 계산 헬퍼 함수
-            def resolve_relative_path(item: dict) -> Optional[str]:
-                item_name = normalize_str(item.get('name', ''))
-                parents = item.get('parents', [])
-                if not parents:
-                    if self.folder_id:
-                        return None
-                    return item_name
-
-                parent_id = parents[0]
-                if self.folder_id:
-                    if parent_id != self.folder_id and parent_id not in allowed_parent_ids:
-                        return None
-
-                path_parts = [item_name]
-                curr = parent_id
-                visited = set()
-                while curr in folders_map and curr not in visited:
-                    visited.add(curr)
-                    if self.folder_id and curr == self.folder_id:
-                        break
-                    path_parts.insert(0, folders_map[curr]['name'])
-                    curr_parents = folders_map[curr].get('parents', [])
-                    if not curr_parents:
-                        break
-                    curr = curr_parents[0]
-
-                return '/'.join(path_parts)
-
-            # 5. PDF 파일 필터링 및 경로 결합
-            pdf_files: List[dict] = []
-            for item in all_items:
-                mime_type = item.get('mimeType', '')
-                raw_name = item.get('name', '')
-                if mime_type == 'application/pdf' or raw_name.lower().endswith('.pdf'):
-                    rel_path = resolve_relative_path(item)
-                    if rel_path:
-                        item['name'] = normalize_str(raw_name)
-                        item['relative_path'] = rel_path
-                        pdf_files.append(item)
-
-            pdf_files.sort(key=lambda x: x['relative_path'])
-            return pdf_files
-
+            all_items = self._list_all_items()
         except Exception as e:
             print(f"[GoogleDriveManager] 파일 목록 조회 실패: {e}")
             return []
+
+        folders_map: Dict[str, dict] = {
+            item['id']: {'name': normalize_str(item.get('name', '')), 'parents': item.get('parents') or []}
+            for item in all_items
+            if item.get('mimeType') == FOLDER_MIME
+        }
+
+        records: List[dict] = []
+        for item in all_items:
+            if item.get('mimeType') == FOLDER_MIME or not is_pdf_item(item):
+                continue
+            folder_path = self._resolve_folder_path(item, folders_map)
+            if folder_path is None:
+                continue
+            records.append({
+                'id': item['id'],
+                'name': normalize_str(item.get('name', '')),
+                'folder_path': folder_path,
+                'size_bytes': int(item.get('size') or 0),
+                'md5': item.get('md5Checksum') or "",
+                'modified_time': item.get('modifiedTime') or "",
+                'web_view_link': item.get('webViewLink') or "",
+            })
+
+        records.sort(key=lambda r: (r['folder_path'], r['name']))
+        return records
 
     def download_new_pdfs(self, target_dir: str or Path, force_recheck_md5: bool = False) -> List[Path]:
         """새로운 PDF 파일들을 드라이브 디렉토리 구조를 보존하여 청크 단위로 로컬에 다운로드합니다 (MD5 해시/크기 검증 지원)."""
