@@ -234,5 +234,37 @@ class TestListingOnly(unittest.TestCase):
         self.assertEqual(make_drive([]).token_file.name, "token.json")
 
 
+class TestSlashInFileName(unittest.TestCase):
+    """KBI-2#3 KBI-2#B1 파일명 속 '/'는 폴더 구분자가 아니다."""
+
+    ITEMS = [
+        {"id": "f_kb", "name": "knowledge-base", "mimeType": FOLDER, "parents": ["root_id"]},
+        {"id": "f_raw", "name": "raw-data", "mimeType": FOLDER, "parents": ["f_kb"]},
+        {"id": "ab", "name": "A/B-테스트", "mimeType": PDF, "parents": ["f_raw"]},
+        {"id": "c", "name": "C/D/E.pdf", "mimeType": PDF, "parents": ["root_id"]},
+    ]
+
+    def test_kbi_2_3_slash_name_split_correctly(self):
+        """KBI-2#3 KBI-2#B1 knowledge-base/raw-data 안의 'A/B-테스트' → folder_path와 name이 올바르게 분리된다."""
+        files = {f["id"]: f for f in make_drive(self.ITEMS).list_pdf_files()}
+        self.assertEqual(files["ab"]["folder_path"], "knowledge-base/raw-data")
+        self.assertEqual(files["ab"]["name"], "A/B-테스트")
+
+    def test_kbi_2_b1_folder_path_only_from_parent_folders(self):
+        """KBI-2#B1 KBI-2#3 folder_path는 상위 폴더 이름만으로 만들며 파일명을 쪼개지 않는다 (루트 파일 'C/D/E.pdf' → "")."""
+        files = {f["id"]: f for f in make_drive(self.ITEMS).list_pdf_files()}
+        self.assertEqual(files["c"]["folder_path"], "")
+        self.assertEqual(files["c"]["name"], "C/D/E.pdf")
+        self.assertNotIn("knowledge-base/raw-data/A", {f["folder_path"] for f in files.values()})
+
+    def test_kbi_2_b1_slash_in_folder_name_kept_whole(self):
+        """KBI-2#B1 KBI-2#3 폴더 이름의 '/'도 이름 그대로 이어붙일 뿐 별도 해석하지 않는다."""
+        items = [
+            {"id": "f1", "name": "I/O", "mimeType": FOLDER, "parents": ["root_id"]},
+            {"id": "b", "name": "b.pdf", "mimeType": PDF, "parents": ["f1"]},
+        ]
+        self.assertEqual(make_drive(items).list_pdf_files()[0]["folder_path"], "I/O")
+
+
 if __name__ == "__main__":
     unittest.main()
