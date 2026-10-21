@@ -217,5 +217,67 @@ class TestClassify(unittest.TestCase):
             self.assertEqual(assign(_rec(name), self.cats), ("4. 웹·백엔드 프레임워크", "Spring·JPA"), name)
 
 
+CATEGORY_NAMES = [
+    "1. 컴퓨터 과학 기초", "2. 프로그래밍 언어", "3. 소프트웨어 설계·품질", "4. 웹·백엔드 프레임워크",
+    "5. 데이터베이스", "6. 인프라·DevOps·클라우드", "7. AI·데이터 과학", "8. 수학",
+    "9. 기술 면접·코딩 테스트", "10. IT 자격증", "11. 부동산·감정평가·법", "12. 건축·건설 관리",
+    "13. 경영·금융·회계", "14. 학습·글쓰기·교양", "15. 어학", "16. 논문(Saved from Chrome)",
+]
+
+
+class TestMigratedCategories(unittest.TestCase):
+    """실제 config/categories.yaml(2026-10-21 16분야 수동 분류본 이관)을 오프라인으로 지킨다."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cats = load_categories()  # 기본 경로 config/categories.yaml
+
+    def test_kbi_3_2_sixteen_categories_in_order(self):
+        """KBI-3#2 이관된 16분야가 원래 이름·순서 그대로다."""
+        self.assertEqual(list(self.cats.tree), CATEGORY_NAMES)
+        self.assertEqual(list(self.cats.tree["1. 컴퓨터 과학 기초"]),
+                         ["이론·고전", "알고리즘·자료구조", "운영체제·시스템 프로그래밍", "네트워크·통신·멀티미디어"])
+        self.assertEqual(sum(len(subs) for subs in self.cats.tree.values()), 55)
+
+    def test_kbi_3_2_structure_valid_and_no_duplicate_keys(self):
+        """KBI-3#2 KBI-3#B3 모든 세부분야가 비어 있지 않고 제목 키가 중복 없이 색인된다."""
+        titles = [t for subs in self.cats.tree.values() for ts in subs.values() for t in ts]
+        for cat, subs in self.cats.tree.items():
+            for sub, ts in subs.items():
+                self.assertTrue(ts, f"{cat} > {sub}")
+        self.assertEqual(len(self.cats.index), len(titles))
+        self.assertGreaterEqual(len(titles), 232)  # 2026-10-21 드라이브 도서 232권 + 현재 없는 제목 1개
+
+    def test_kbi_3_2_titles_are_human_readable(self):
+        """KBI-3#2 제목은 'Copy of '·'.pdf' 없는 사람이 읽는 형태로 저장돼 있다."""
+        for subs in self.cats.tree.values():
+            for ts in subs.values():
+                for t in ts:
+                    self.assertFalse(t.startswith("Copy of "), t)
+                    self.assertFalse(t.lower().endswith(".pdf"), t)
+                    self.assertEqual(t, unicodedata.normalize("NFC", t))
+
+    def test_kbi_3_2_no_unclassified_in_config(self):
+        """KBI-3#2 '미분류'는 설정에 두지 않는다(매핑 없는 책 전용)."""
+        self.assertNotIn(UNCLASSIFIED[0], self.cats.tree)
+
+    def test_kbi_3_2_sample_books_classified(self):
+        """KBI-3#2 대표 도서(이름 변경된 책·'/' 포함 이름 포함)가 원래 세부분야로 분류된다."""
+        expected = {
+            "A/B-테스트": ("7. AI·데이터 과학", "데이터 분석·추천·검색"),
+            "토비의-스프링-1.pdf": ("4. 웹·백엔드 프레임워크", "Spring·JPA"),
+            "이산수학.pdf": ("8. 수학", "이산수학·논리·증명"),
+            "SICP.pdf": ("1. 컴퓨터 과학 기초", "이론·고전"),
+            "TLPI-1.pdf": ("1. 컴퓨터 과학 기초", "운영체제·시스템 프로그래밍"),
+        }
+        for name, place in expected.items():
+            self.assertEqual(assign(_rec(name), self.cats), place, name)
+
+    def test_kbi_3_2_notes_refer_to_known_titles(self):
+        """KBI-3#2 notes의 제목은 모두 분류 체계에 있는 제목이다."""
+        for k in self.cats.notes:
+            self.assertIn(k, self.cats.index)
+
+
 if __name__ == "__main__":
     unittest.main()
