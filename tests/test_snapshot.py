@@ -6,7 +6,7 @@ import unittest
 from datetime import date, datetime
 from pathlib import Path
 
-from src.snapshot import load_latest_snapshot, save_snapshot
+from src.snapshot import Change, Changes, diff_snapshots, load_latest_snapshot, save_snapshot
 
 
 def _rec(id_, name, folder="IT/개발", md5="m", size=1):
@@ -109,6 +109,78 @@ class TestLedgerDirSetting(unittest.TestCase):
             if old is not None:
                 os.environ["DOCTREE_LEDGER_DIR"] = old
             importlib.reload(settings)
+
+
+class TestDiffSnapshots(unittest.TestCase):
+    def test_kbi_4_2_no_changes(self):
+        """KBI-4#2 같은 목록이면 변경이 없다."""
+        recs = [_rec("a", "A.pdf"), _rec("b", "B.pdf")]
+        ch = diff_snapshots(recs, [dict(r) for r in recs])
+        self.assertTrue(ch.is_empty)
+        self.assertEqual(ch, Changes())
+
+    def test_kbi_4_2_added_and_removed(self):
+        """KBI-4#2 새 id는 추가, 사라진 id는 삭제로 구분한다."""
+        ch = diff_snapshots([_rec("a", "A.pdf")], [_rec("b", "B.pdf")])
+        self.assertEqual([r["id"] for r in ch.added], ["b"])
+        self.assertEqual([r["id"] for r in ch.removed], ["a"])
+        self.assertEqual((ch.renamed, ch.moved, ch.content_changed), ([], [], []))
+        self.assertFalse(ch.is_empty)
+
+    def test_kbi_4_2_renamed(self):
+        """KBI-4#2 이름이 바뀌면 이름 변경(old→new)으로 기록한다."""
+        ch = diff_snapshots([_rec("a", "A.pdf")], [_rec("a", "A2.pdf")])
+        self.assertEqual(ch.renamed, [Change("a", "A2.pdf", "A.pdf", "A2.pdf")])
+        self.assertEqual((ch.added, ch.removed, ch.moved), ([], [], []))
+
+    def test_kbi_4_2_moved(self):
+        """KBI-4#2 folder_path가 바뀌면 폴더 이동(old→new)으로 기록한다."""
+        ch = diff_snapshots([_rec("a", "A.pdf", folder="IT")], [_rec("a", "A.pdf", folder="IT/개발")])
+        self.assertEqual(ch.moved, [Change("a", "A.pdf", "IT", "IT/개발")])
+        self.assertEqual(ch.renamed, [])
+
+    def test_kbi_4_2_content_changed_by_md5(self):
+        """KBI-4#2 MD5가 바뀌면 내용 변경으로 기록한다."""
+        ch = diff_snapshots([_rec("a", "A.pdf", md5="x")], [_rec("a", "A.pdf", md5="y")])
+        self.assertEqual(ch.content_changed, [Change("a", "A.pdf", "x", "y")])
+
+    def test_kbi_4_2_content_same_md5_different_size_ignored(self):
+        """KBI-4#2 MD5가 둘 다 있고 같으면 크기·수정시각이 달라도 내용 변경이 아니다."""
+        old = _rec("a", "A.pdf", md5="x", size=1)
+        new = dict(_rec("a", "A.pdf", md5="x", size=2), modified_time="2026-02-02T00:00:00Z")
+        self.assertTrue(diff_snapshots([old], [new]).is_empty)
+
+    def test_kbi_4_2_content_changed_by_size_when_md5_missing(self):
+        """KBI-4#2 MD5가 비어 있으면 크기로 내용 변경을 판단한다."""
+        ch = diff_snapshots([_rec("a", "A.pdf", md5="", size=1)], [_rec("a", "A.pdf", md5="", size=2)])
+        self.assertEqual(ch.content_changed, [Change("a", "A.pdf", "1", "2")])
+        same = diff_snapshots([_rec("a", "A.pdf", md5="", size=1)], [_rec("a", "A.pdf", md5="", size=1)])
+        self.assertTrue(same.is_empty)
+
+    def test_kbi_4_b1_identity_is_id_only(self):
+        """KBI-4#B1 같은 id면 이름·경로가 모두 바뀌어도 추가+삭제가 아니라 같은 책이다."""
+        ch = diff_snapshots([_rec("a", "A.pdf", folder="X")], [_rec("a", "Z.pdf", folder="Y")])
+        self.assertEqual((ch.added, ch.removed), ([], []))
+
+    def test_kbi_4_b1_same_name_different_id_is_add_remove(self):
+        """KBI-4#B1 이름·경로가 같아도 id가 다르면 다른 책(삭제+추가)이다."""
+        ch = diff_snapshots([_rec("a", "A.pdf")], [_rec("b", "A.pdf")])
+        self.assertEqual([r["id"] for r in ch.added], ["b"])
+        self.assertEqual([r["id"] for r in ch.removed], ["a"])
+
+    def test_kbi_4_b2_rename_and_move_both_recorded(self):
+        """KBI-4#B2 이름 변경과 폴더 이동이 동시에 일어나면 둘 다 기록한다."""
+        ch = diff_snapshots([_rec("a", "A.pdf", folder="X")], [_rec("a", "Z.pdf", folder="Y")])
+        self.assertEqual(ch.renamed, [Change("a", "Z.pdf", "A.pdf", "Z.pdf")])
+        self.assertEqual(ch.moved, [Change("a", "Z.pdf", "X", "Y")])
+
+    def test_kbi_4_2_sorted_output(self):
+        """KBI-4#2 각 목록은 입력 순서와 무관하게 정렬된다."""
+        new = [_rec("b", "나.pdf"), _rec("a", "가.pdf")]
+        ch1 = diff_snapshots([], new)
+        ch2 = diff_snapshots([], list(reversed(new)))
+        self.assertEqual(ch1, ch2)
+        self.assertEqual([r["name"] for r in ch1.added], ["가.pdf", "나.pdf"])
 
 
 if __name__ == "__main__":

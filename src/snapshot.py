@@ -6,6 +6,7 @@ ledger/
 """
 import json
 import re
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple, Union
@@ -63,3 +64,74 @@ def load_latest_snapshot(ledger_dir: PathLike) -> Optional[Tuple[date, List[Reco
     day, path = max(candidates)
     data = json.loads(path.read_text(encoding="utf-8"))
     return day, list(data.get("records", []))
+
+
+@dataclass(frozen=True)
+class Change:
+    """같은 id 파일의 한 가지 속성 변경. name은 현재(새) 파일명, old/new는 바뀐 값."""
+
+    id: str
+    name: str
+    old: str
+    new: str
+
+
+@dataclass
+class Changes:
+    """직전 스냅샷 대비 변경 묶음.
+
+    같은 책 판정은 id만 쓴다(B1). 한 파일에 이름 변경과 폴더 이동이 함께 일어나면
+    renamed와 moved 양쪽에 각각 기록된다(B2).
+    """
+
+    added: List[Record] = field(default_factory=list)
+    removed: List[Record] = field(default_factory=list)
+    renamed: List[Change] = field(default_factory=list)
+    moved: List[Change] = field(default_factory=list)
+    content_changed: List[Change] = field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.added or self.removed or self.renamed or self.moved or self.content_changed)
+
+
+def _record_sort_key(r: Record):
+    return (str(r.get("folder_path", "")), str(r.get("name", "")), str(r.get("id", "")))
+
+
+def _change_sort_key(c: Change):
+    return (c.name, c.id)
+
+
+def _content_change(old: Record, new: Record) -> Optional[Tuple[str, str]]:
+    """내용 변경이면 (old, new) 표시값을, 아니면 None.
+
+    MD5가 양쪽 다 있으면 MD5로, 한쪽이라도 비어 있으면 크기(size_bytes)로 판단한다.
+    """
+    om, nm = old.get("md5") or "", new.get("md5") or ""
+    if om and nm:
+        return (om, nm) if om != nm else None
+    os_, ns = old.get("size_bytes"), new.get("size_bytes")
+    return (str(os_), str(ns)) if os_ != ns else None
+
+
+def diff_snapshots(old_records: Iterable[Record], new_records: Iterable[Record]) -> Changes:
+    """두 레코드 목록을 파일 id 기준으로 비교한다."""
+    old = {r["id"]: r for r in old_records}
+    new = {r["id"]: r for r in new_records}
+    ch = Changes()
+    ch.added = sorted((new[i] for i in new.keys() - old.keys()), key=_record_sort_key)
+    ch.removed = sorted((old[i] for i in old.keys() - new.keys()), key=_record_sort_key)
+    for i in new.keys() & old.keys():
+        o, n = old[i], new[i]
+        name = str(n.get("name", ""))
+        if o.get("name") != n.get("name"):
+            ch.renamed.append(Change(i, name, str(o.get("name", "")), name))
+        if o.get("folder_path") != n.get("folder_path"):
+            ch.moved.append(Change(i, name, str(o.get("folder_path", "")), str(n.get("folder_path", ""))))
+        cc = _content_change(o, n)
+        if cc:
+            ch.content_changed.append(Change(i, name, cc[0], cc[1]))
+    for lst in (ch.renamed, ch.moved, ch.content_changed):
+        lst.sort(key=_change_sort_key)
+    return ch
