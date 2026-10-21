@@ -325,5 +325,37 @@ class TestScope(unittest.TestCase):
             self.assertIn("trashed=false", list_kwargs(drive)["q"].replace(" ", ""))
 
 
+class TestPdfFilter(unittest.TestCase):
+    """KBI-2#5 KBI-2#B2 도서 PDF 판정."""
+
+    ITEMS = [
+        {"id": "folder_pdf", "name": "모음.pdf", "mimeType": FOLDER, "parents": ["root_id"]},
+        {"id": "pdf_mime", "name": "패턴을-활용한-리팩토링", "mimeType": PDF, "parents": ["root_id"]},
+        {"id": "pdf_ext_upper", "name": "BOOK.PDF", "mimeType": "application/octet-stream", "parents": ["root_id"]},
+        {"id": "pdf_both", "name": "a.pdf", "mimeType": PDF, "parents": ["root_id"]},
+        {"id": "doc", "name": "notes", "mimeType": "application/vnd.google-apps.document", "parents": ["root_id"]},
+        {"id": "epub", "name": "book.epub", "mimeType": "application/epub+zip", "parents": ["root_id"]},
+        {"id": "pdf_in_middle", "name": "a.pdf.zip", "mimeType": "application/zip", "parents": ["root_id"]},
+    ]
+
+    def ids(self):
+        return {f["id"] for f in make_drive(self.ITEMS).list_pdf_files()}
+
+    def test_kbi_2_5_only_pdf_mime_or_extension(self):
+        """KBI-2#5 mimeType이 application/pdf이거나 이름이 .pdf(대소문자 무시)로 끝나는 파일만 수집한다."""
+        self.assertEqual(self.ids(), {"pdf_mime", "pdf_ext_upper", "pdf_both"})
+
+    def test_kbi_2_5_folders_and_other_types_excluded(self):
+        """KBI-2#5 폴더(이름이 .pdf로 끝나도)와 다른 형식(문서·epub·zip)은 제외한다."""
+        ids = self.ids()
+        for excluded in ("folder_pdf", "doc", "epub", "pdf_in_middle"):
+            self.assertNotIn(excluded, ids)
+
+    def test_kbi_2_b2_pdf_mime_without_extension_included(self):
+        """KBI-2#B2 KBI-2#5 확장자가 없어도 mimeType이 application/pdf면 도서로 본다 (예: 패턴을-활용한-리팩토링)."""
+        files = {f["id"]: f for f in make_drive(self.ITEMS).list_pdf_files()}
+        self.assertEqual(files["pdf_mime"]["name"], "패턴을-활용한-리팩토링")
+
+
 if __name__ == "__main__":
     unittest.main()
