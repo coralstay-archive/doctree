@@ -1,6 +1,6 @@
 ---
 id: KBI-6
-title: 대장 렌더링과 kb-index update 명령
+title: 대장 렌더링과 doctree update 명령
 status: To Do
 assignee: []
 created_date: '2026-10-21 09:37'
@@ -29,7 +29,7 @@ references:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 kb-index update가 조회 · 분류 · 점검 · 스냅샷/이력을 거쳐 ledger/도서목록.md를 생성한다
+- [ ] #1 doctree update가 조회 · 분류 · 점검 · 스냅샷/이력을 거쳐 ledger/도서목록.md를 생성한다
 - [ ] #2 대장에 기준 시각, 스토리지 현황, 폴더 구성, 분야별 권수·용량, 분류 트리, 분야별 상세 표(제목·용량·경로·비고), 경고, 최근 변경 요약이 들어간다
 - [ ] #3 상세 표의 제목은 드라이브 web_view_link로 연결된다
 - [ ] #4 README를 새 용도로 다시 쓰고 루트의 도서목록-분류.md를 삭제한다
