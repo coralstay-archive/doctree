@@ -4,7 +4,7 @@ import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import yaml
 
@@ -33,6 +33,8 @@ def title_key(name: str) -> str:
 
 
 Place = Tuple[str, str]  # (분야, 세부분야)
+
+UNCLASSIFIED: Place = ("미분류", "미분류")
 
 
 class CategoryConfigError(ValueError):
@@ -124,3 +126,27 @@ def load_categories(path: Union[str, Path, None] = None) -> Categories:
         raise CategoryConfigError(f"{path}: 'notes'는 제목 → 비고 매핑이어야 합니다")
     notes = {title_key(str(t)): str(v) for t, v in raw_notes.items()}
     return Categories(tree=tree, index=index, notes=notes)
+
+
+def assign(record: dict, categories: Categories) -> Place:
+    """레코드의 (분야, 세부분야). 파일명(record['name'])만 보며 folder_path는 쓰지 않는다.
+    매핑이 없으면 UNCLASSIFIED."""
+    return categories.lookup(record.get("name") or "") or UNCLASSIFIED
+
+
+def classify(records: Iterable[dict], categories: Categories) -> "OrderedDict[str, OrderedDict[str, List[dict]]]":
+    """레코드를 {분야: {세부분야: [레코드]}}로 묶는다.
+
+    분야·세부분야 순서는 categories.yaml 순서를 따르고(빈 세부분야도 포함),
+    '미분류 > 미분류'는 항상 마지막에 둔다. 각 목록 안에서는 입력 순서를 유지하며,
+    매핑 없는 레코드도 빠지지 않는다.
+    """
+    groups: "OrderedDict[str, OrderedDict[str, List[dict]]]" = OrderedDict(
+        (cat, OrderedDict((sub, []) for sub in subs)) for cat, subs in categories.tree.items()
+    )
+    groups.setdefault(UNCLASSIFIED[0], OrderedDict()).setdefault(UNCLASSIFIED[1], [])
+    groups.move_to_end(UNCLASSIFIED[0])
+    for rec in records:
+        cat, sub = assign(rec, categories)
+        groups[cat][sub].append(rec)
+    return groups

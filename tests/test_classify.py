@@ -5,7 +5,7 @@ import unicodedata
 import unittest
 from pathlib import Path
 
-from src.classify import CategoryConfigError, load_categories, title_key
+from src.classify import UNCLASSIFIED, CategoryConfigError, assign, classify, load_categories, title_key
 
 
 def _write_yaml(text: str) -> Path:
@@ -159,6 +159,62 @@ class TestLoadCategories(unittest.TestCase):
     def test_kbi_3_b3_config_error_is_value_error(self):
         """KBI-3#B3 설정 오류는 ValueError 하위 타입이라 CLI가 잡아 비정상 종료할 수 있다."""
         self.assertTrue(issubclass(CategoryConfigError, ValueError))
+
+
+def _rec(name, folder_path="knowledge-base/raw-data", id_=None):
+    return {"id": id_ or name, "name": name, "folder_path": folder_path, "size_bytes": 1}
+
+
+class TestClassify(unittest.TestCase):
+    def setUp(self):
+        self.cats = load_categories(_write_yaml(TestLoadCategories.SAMPLE))
+
+    def test_kbi_3_3_unmapped_goes_to_unclassified(self):
+        """KBI-3#3 매핑되지 않은 책은 ('미분류', '미분류')로 분류된다."""
+        self.assertEqual(UNCLASSIFIED, ("미분류", "미분류"))
+        self.assertEqual(assign(_rec("새로-산-책.pdf"), self.cats), UNCLASSIFIED)
+        self.assertEqual(assign(_rec("SICP.pdf"), self.cats), ("1. 컴퓨터 과학 기초", "이론·고전"))
+
+    def test_kbi_3_3_groups_in_config_order_with_unclassified_last(self):
+        """KBI-3#3 결과는 YAML의 분야·세부분야 순서를 따르고 '미분류'가 마지막에 온다."""
+        groups = classify([_rec("SICP.pdf")], self.cats)
+        self.assertEqual(list(groups), ["1. 컴퓨터 과학 기초", "4. 웹·백엔드 프레임워크", "미분류"])
+        self.assertEqual(list(groups["1. 컴퓨터 과학 기초"]), ["이론·고전", "알고리즘·자료구조"])
+        self.assertEqual(groups["미분류"]["미분류"], [])
+
+    def test_kbi_3_3_preserves_input_order_within_group(self):
+        """KBI-3#3 같은 세부분야 안에서는 입력 순서를 유지한다."""
+        recs = [_rec("C.O.D.E.pdf"), _rec("zzz.pdf"), _rec("SICP.pdf"), _rec("aaa.pdf")]
+        groups = classify(recs, self.cats)
+        self.assertEqual([r["name"] for r in groups["1. 컴퓨터 과학 기초"]["이론·고전"]], ["C.O.D.E.pdf", "SICP.pdf"])
+        self.assertEqual([r["name"] for r in groups["미분류"]["미분류"]], ["zzz.pdf", "aaa.pdf"])
+
+    def test_kbi_3_b2_no_record_dropped(self):
+        """KBI-3#B2 KBI-3#3 매핑 없는 책을 포함해 입력 레코드가 하나도 빠지지 않는다(중복 이름 포함)."""
+        recs = [_rec("SICP.pdf", id_="a"), _rec("SICP.pdf", "other", id_="b"), _rec("미지의-책", id_="c"),
+                _rec("", id_="d"), _rec("토비의-스프링-1.pdf", id_="e")]
+        groups = classify(recs, self.cats)
+        out = [r["id"] for subs in groups.values() for rs in subs.values() for r in rs]
+        self.assertEqual(sorted(out), ["a", "b", "c", "d", "e"])
+        self.assertEqual([r["id"] for r in groups["미분류"]["미분류"]], ["c", "d"])
+
+    def test_kbi_3_b2_unclassified_name_in_config_is_still_one_group(self):
+        """KBI-3#B2 YAML에 '미분류' 분야가 있어도 매핑 없는 책은 같은 '미분류 > 미분류'에 합쳐진다."""
+        cats = load_categories(_write_yaml('categories:\n  "미분류":\n    "미분류":\n      - "x"\n'))
+        groups = classify([_rec("x.pdf"), _rec("y.pdf")], cats)
+        self.assertEqual(list(groups), ["미분류"])
+        self.assertEqual([r["name"] for r in groups["미분류"]["미분류"]], ["x.pdf", "y.pdf"])
+
+    def test_kbi_3_b1_folder_path_ignored(self):
+        """KBI-3#B1 KBI-3#4 폴더를 옮겨도 분류가 바뀌지 않는다(folder_path는 쓰지 않음)."""
+        for folder in ("", "책들/ref-doc", "knowledge-base/raw-data/새 폴더", "1. 컴퓨터 과학 기초"):
+            self.assertEqual(assign(_rec("SICP.pdf", folder), self.cats), ("1. 컴퓨터 과학 기초", "이론·고전"))
+        self.assertEqual(assign(_rec("새 책", "4. 웹·백엔드 프레임워크/Spring·JPA"), self.cats), UNCLASSIFIED)
+
+    def test_kbi_3_b1_cosmetic_rename_keeps_category(self):
+        """KBI-3#B1 KBI-3#4 .pdf 추가·하이픈/공백·대소문자 변경만으로는 분류가 바뀌지 않는다."""
+        for name in ("토비의-스프링-1", "토비의-스프링-1.pdf", "토비의 스프링 1.PDF", "Copy of 토비의스프링1.pdf"):
+            self.assertEqual(assign(_rec(name), self.cats), ("4. 웹·백엔드 프레임워크", "Spring·JPA"), name)
 
 
 if __name__ == "__main__":
