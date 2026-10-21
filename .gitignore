@@ -12,7 +12,10 @@ __pycache__/
 .venv/
 .pytest_cache/
 
-# Pipeline data / test output
+# Ledger outputs (도서 목록 대장 산출물은 커밋하지 않음)
+ledger/
+
+# Legacy pipeline data / test output
 data/
 tmp_output/
 

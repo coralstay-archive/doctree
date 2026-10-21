@@ -1,5 +1,6 @@
 """프로젝트 구성 검증 (KBI-1)."""
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -56,6 +57,22 @@ class TestDependenciesRemoved(unittest.TestCase):
         names = _pyproject_dep_names()
         for dep in ("google-api-python-client", "google-auth-oauthlib", "python-dotenv", "rich", "pytest"):
             self.assertIn(dep, names)
+
+
+class TestLedgerIgnored(unittest.TestCase):
+    def test_kbi_1_4_gitignore_has_ledger(self):
+        """KBI-1#4 KBI-1#B2 .gitignore에 ledger/가 있다."""
+        lines = [l.strip() for l in (ROOT / ".gitignore").read_text().splitlines()]
+        self.assertIn("ledger/", lines)
+
+    def test_kbi_1_b2_ledger_outputs_ignored_by_git(self):
+        """KBI-1#B2 KBI-1#4 대장 산출물(ledger/*)은 git이 무시해 커밋되지 않는다."""
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", "ledger/도서목록.md"],
+            cwd=ROOT,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":
