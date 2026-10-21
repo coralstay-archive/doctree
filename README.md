@@ -1,4 +1,4 @@
-# knowledge-base-index (`kb-index`)
+# booktree
 
 구글 드라이브의 도서 PDF 메타데이터만 읽어 도서 목록 대장을 만드는 작은 CLI입니다.
 
@@ -23,8 +23,8 @@ pip install -e .
 
 ### 3. CLI 명령어
 ```bash
-kb-index auth      # Google OAuth 2.0 로그인(token.json 생성·갱신) 후 계정 정보 출력
-kb-index status    # 구글 드라이브 계정 및 스토리지 용량 출력
+booktree auth      # Google OAuth 2.0 로그인(token.json 생성·갱신) 후 계정 정보 출력
+booktree status    # 구글 드라이브 계정 및 스토리지 용량 출력
 ```
 
 ## 🧪 테스트

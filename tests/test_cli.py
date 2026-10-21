@@ -1,4 +1,4 @@
-"""kb-index CLI 검증 (KBI-1#3, KBI-1#B1)."""
+"""booktree CLI 검증 (KBI-1#3, KBI-1#B1)."""
 import contextlib
 import io
 import re
@@ -26,15 +26,15 @@ class TestPackaging(unittest.TestCase):
         self.text = (ROOT / "pyproject.toml").read_text()
 
     def test_kbi_1_3_package_name(self):
-        """KBI-1#3 패키지명은 knowledge-base-index다."""
-        self.assertRegex(_section(self.text, "project"), r'(?m)^name\s*=\s*"knowledge-base-index"\s*$')
+        """KBI-1#3 패키지명은 booktree다."""
+        self.assertRegex(_section(self.text, "project"), r'(?m)^name\s*=\s*"booktree"\s*$')
 
-    def test_kbi_1_3_single_kb_index_entry_point(self):
-        """KBI-1#3 CLI 진입점은 kb-index 하나이고 옛 진입점은 없다."""
+    def test_kbi_1_3_single_booktree_entry_point(self):
+        """KBI-1#3 CLI 진입점은 booktree 하나이고 옛 진입점은 없다."""
         scripts = _section(self.text, "project.scripts")
         entries = dict(re.findall(r'(?m)^\s*"?([\w\-]+)"?\s*=\s*"([^"]+)"', scripts))
-        self.assertEqual(entries, {"kb-index": "src.cli:main"})
-        for old in ("gdrive-book-markdown-pipeline", "gdrive-md", "book2md", "pdf2md"):
+        self.assertEqual(entries, {"booktree": "src.cli:main"})
+        for old in ("gdrive-book-markdown-pipeline", "gdrive-md", "book2md", "pdf2md", "kb" + "-index", "knowledge-base" + "-index"):
             self.assertNotIn(old, self.text)
 
     def test_kbi_1_3_setuptools_has_no_deleted_modules(self):
@@ -43,12 +43,22 @@ class TestPackaging(unittest.TestCase):
         self.assertNotIn("main", setuptools)
         self.assertNotIn("auth_login", setuptools)
 
+    def test_kbi_1_3_no_old_names_left(self):
+        """KBI-1#3 README·src·tests·pyproject에 옛 이름(kb·index 계열)이 남지 않는다."""
+        old_names = ("kb" + "-index", "knowledge-base" + "-index")
+        files = [ROOT / "README.md", ROOT / "pyproject.toml"]
+        files += list((ROOT / "src").rglob("*.py")) + list((ROOT / "tests").rglob("*.py"))
+        for path in files:
+            text = path.read_text()
+            for old in old_names:
+                self.assertNotIn(old, text, str(path))
+
 
 class TestParser(unittest.TestCase):
     def test_kbi_1_3_help_lists_auth_and_status(self):
-        """KBI-1#3 kb-index --help에 auth·status 명령이 보인다."""
+        """KBI-1#3 booktree --help에 auth·status 명령이 보인다."""
         parser = cli.build_parser()
-        self.assertEqual(parser.prog, "kb-index")
+        self.assertEqual(parser.prog, "booktree")
         help_text = parser.format_help()
         self.assertIn("auth", help_text)
         self.assertIn("status", help_text)
@@ -77,7 +87,7 @@ class TestCommands(unittest.TestCase):
     @patch("src.cli.print_account_dashboard")
     @patch("src.cli.GoogleDriveManager")
     def test_kbi_1_3_auth_prints_account_dashboard(self, mock_cls, mock_dash):
-        """KBI-1#3 kb-index auth는 인증 후 계정 대시보드를 출력한다."""
+        """KBI-1#3 booktree auth는 인증 후 계정 대시보드를 출력한다."""
         mock_cls.return_value = self._fake_drive()
         self.assertEqual(cli.main(["auth"]), 0)
         mock_dash.assert_called_once_with(ACCOUNT)
@@ -85,7 +95,7 @@ class TestCommands(unittest.TestCase):
     @patch("src.cli.print_account_dashboard")
     @patch("src.cli.GoogleDriveManager")
     def test_kbi_1_3_status_prints_account_dashboard(self, mock_cls, mock_dash):
-        """KBI-1#3 kb-index status는 계정·용량 대시보드를 출력한다."""
+        """KBI-1#3 booktree status는 계정·용량 대시보드를 출력한다."""
         mock_cls.return_value = self._fake_drive()
         self.assertEqual(cli.main(["status"]), 0)
         mock_dash.assert_called_once_with(ACCOUNT)

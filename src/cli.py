@@ -1,4 +1,4 @@
-"""kb-index: 구글 드라이브 도서 PDF 목록 대장 생성 CLI."""
+"""booktree: 구글 드라이브 도서 PDF 목록 대장 생성 CLI."""
 import argparse
 from typing import List, Optional
 
@@ -41,7 +41,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="kb-index",
+        prog="booktree",
         description="구글 드라이브 도서 PDF 목록 대장 생성 CLI",
     )
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")
