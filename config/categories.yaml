@@ -1,0 +1,328 @@
+# 도서 분류 체계: 분야 > 세부분야 > 제목 목록.
+# 제목은 사람이 읽는 형태(드라이브 파일명에서 .pdf를 뺀 것)로 적고,
+# 로더가 src.classify.title_key()로 정규화해 매칭한다
+# (NFC, .pdf 제거, 'Copy of ' 제거, 하이픈·공백 무시, 소문자화; '/'는 유지).
+# 한 제목 키는 정확히 하나의 세부분야에만 있어야 한다(중복 시 설정 오류).
+# 2026-10-21 수동 분류본(16분야, 도서목록-분류.md)에서 이관.
+
+categories:
+  "1. 컴퓨터 과학 기초":
+    "이론·고전":
+      - "SICP"
+      - "the-art-of-programming-4a"
+      - "C.O.D.E"
+      - "알고리즘-산책-수학에서-제네릭-프로그래밍까지"
+    "알고리즘·자료구조":
+      - "종만북-1권"
+      - "종만북-2권"
+      - "쓰면서-익히는-알고리즘과-자료구조"
+    "운영체제·시스템 프로그래밍":
+      - "Operating-Systems-Three-Easy-Pieces"
+      - "TLPI-1"
+      - "TLPI-2"
+      - "BPF-성능-분석-도구"
+      - "코드로-알아보는-ARM-리눅스-커널"
+      - "임베디드-레시피"
+    "네트워크·통신·멀티미디어":
+      - "데이터통신과-네트워킹"
+      - "통신이론"
+      - "HTTP-완벽-가이드"
+      - "디지털-멀티미디어"
+  "2. 프로그래밍 언어":
+    "Java·JVM":
+      - "모던-자바-인-액션"
+      - "이펙티브-자바-3편"
+      - "JAVA-CONCURRENCY-IN-PRACTICE"
+      - "모던-자바-동시성-프로그래밍"
+      - "JVM-밑바닥까지-파헤치기"
+      - "Trouble-shooting-java"
+      - "트러블-슈팅-자바"
+    "Kotlin":
+      - "Atomic-Kotlin"
+      - "이펙티브-코틀린"
+    "C·C++":
+      - "A-Tour-of-C++"
+      - "C++-STL-프로그래밍"
+      - "고성능을위한씨피피"
+      - "전문가를-위한-C++"
+      - "전문가를-위한-C"
+      - "실무자를-위한-C언어-100제"
+      - "초보자를-위한-C언어-300제"
+    "Python":
+      - "flunt-python"
+      - "초보자를-위한-파이썬-200제"
+    "JavaScript·TypeScript":
+      - "모던-자바-스크립트"
+      - "코어-자바스크립트"
+      - "이펙티브-타입스크립트"
+      - "타입스크립트-React-Nextjs-로-배우는-실전-웹-애플리케이션-개발"
+  "3. 소프트웨어 설계·품질":
+    "클린 코드·리팩터링":
+      - "Code-Complete-2"
+      - "굳코드-배드코드"
+      - "읽기-쉬운-코드"
+      - "리팩터링-2판"
+      - "레거시코드활용전략"
+      - "자바로-배우는-리팩토링-입문"
+      - "패턴을-활용한-리팩토링"
+      - "켄트-벡의-Tidy-First"
+      - "실용주의-프로그래머"
+      - "더-나은-프로그래머-되는법"
+      - "클린-소프트웨어"
+    "객체지향·디자인 패턴·DDD":
+      - "오브젝트"
+      - "디자인-패턴의-아름다움"
+      - "자바-언어로-배우는-디자앤패턴"
+      - "Design-Patterns-in-Java"
+      - "엔터프라이즈-애플리케이션-아키텍처-패턴"
+      - "서비스-디자인-패턴"
+      - "도메인-주도-개발-시작하기"
+      - "만들면서-배우는-클린아키텍처"
+    "소프트웨어 아키텍처·대규모 시스템":
+      - "Fundermentals-of-Software-Architecture"
+      - "소프트웨어-아키텍처-The-Hard-Parts"
+      - "데이터-중심-어플리케이션-설계"
+      - "The-Art-Of-Scalability"
+      - "웹-개발자를-위한-대규모-서비스를-지탱하는-기술"
+      - "모던-API-아키텍처-설계-전략"
+      - "restful-api"
+      - "웹-앱-api-개발을-위한-그래프큐엘"
+      - "Design-Patterns-for-Cloud-Native-Application"
+    "테스트":
+      - "테스트-주도-개발"
+      - "유닛-테스팅-단위-테스트"
+      - "Junit-In-Action-3th"
+      - "자바와-Junit을-활용한-실용주의-단위-테스트"
+      - "Apache-Jmenter-오픈소스로-대용량-웹-서비스-성능-테스트하기"
+    "프로젝트 관리":
+      - "맨먼스미신"
+      - "PMBOK-8th"
+  "4. 웹·백엔드 프레임워크":
+    "Spring·JPA":
+      - "토비의-스프링-1"
+      - "토비의-스프링-2"
+      - "스프링-5레시피-1"
+      - "스프링-5-레시피-2"
+      - "전문가를위한-스프링-5"
+      - "스프링으로-하는-마이크로서비스-구축"
+      - "짧고-굵게-배우는-JSP-웹-프로그래밍과-스프링-프레임워크"
+      - "Java-Persistence-with-Spring-Data-and-Hibernate"
+      - "Persistence-Best-Practice-for-Java-Application"
+    "Java 웹(JSP/서블릿)":
+      - "성낙현의-JSP-자바-웹-프로그래밍-2판"
+      - "자바-웹-개발-워크북"
+      - "자바-웹-프로그래밍-Next-Step"
+  "5. 데이터베이스":
+    "SQL 활용":
+      - "러닝sql"
+      - "실용-SQL"
+      - "sql-cookbook"
+      - "데이터-분석을-위한-SQL-레시피"
+      - "sql안티패턴"
+    "SQL 튜닝·Oracle":
+      - "친절한-SQL-튜닝"
+      - "오라클-성능-고도화-원리와-해법-1-0"
+      - "오라클-성능-고도화-원리와-해법-1-1"
+      - "오라클-성능-고도화-원리와-해법-2-0"
+      - "오라클-성능-고도화-원리와-해법-2-1"
+      - "오라클-성능-고도화-원리와-해법-2-2"
+    "MySQL·MongoDB":
+      - "mysql8.0-1"
+      - "mysql8.0-2"
+      - "real-mongoDB"
+    "SQL 자격증(SQLP·SQLD)":
+      - "sqlp1"
+      - "sqlp2"
+      - "sql전문가가이드"
+      - "SQL-개발자-기출문제-핵심-500제"
+  "6. 인프라·DevOps·클라우드":
+    "컨테이너·클라우드":
+      - "Docker-Deep-Dive"
+      - "The-Kubernetes-book-2023-Edition"
+      - "Cloud-Native"
+      - "aws-비용-최적화"
+      - "배워서-바로-쓰는-aws-14가지-패턴"
+    "DevOps·관찰 가능성·신뢰성":
+      - "이펙티브-데브옵스-2nd"
+      - "데브옵스-엔지니어를-위한-실전-관찰-가능성-엔지니어링"
+      - "프로메테우스-오픈소스-모니터링-시스템"
+      - "Building-Secuire-And-Reliable-System"
+    "Linux·개발 도구(Vim·Git)":
+      - "Adventures-with-the-Linux-Command-Line"
+      - "Efficient-Linux-at-the-Command-Line"
+      - "Practical-Vim-Second-Edition"
+      - "Git-Ry"
+      - "Pro-GIt-공식문서Pdf로-대체할것"
+  "7. AI·데이터 과학":
+    "머신러닝·딥러닝 이론":
+      - "심층학습"
+      - "기계-학습을-다시-묻다"
+      - "인공지능-개론"
+      - "지능에-관하여"
+      - "Deep-Learning-from-scratch"
+      - "Deep-Learning-from-Scratch-3"
+    "LLM·NLP·AI 도구":
+      - "Build-a-Large-Language-Model"
+      - "LLM을-활용한-실전-AI-애플리케이션-개발"
+      - "트랜스포머를-활용한-자연어-처리"
+      - "10가지-프로젝트로-완료하는-트랜스포머"
+      - "클로드-코드-제대로-시작하기"
+    "데이터 분석·추천·검색":
+      - "Doing-Data-Science"
+      - "통계와-머신러닝-파이썬-코드북"
+      - "파이썬-머신러닝-완벽가이드"
+      - "추천-시스템-입문"
+      - "An-Introduction-to-Information-Retrieval"
+      - "A/B-테스트"
+    "데이터 자격증(ADP·빅분기)":
+      - "ADP-필기-데이터-분석-전문가"
+      - "파이썬-한권으로-끝내기-ADP-빅분기-실기대비"
+      - "빅데이터분석기사-실기-파이썬"
+  "8. 수학":
+    "이산수학·논리·증명":
+      - "이산수학"
+      - "수리-논리학-입문"
+      - "How-to-prove-it"
+      - "Proof"
+    "해석학·위상수학":
+      - "real-analysis"
+      - "Principle-of-Topology"
+    "선형대수":
+      - "프리드버그-선형대수학"
+      - "개발자를-위한-실전-선형대수학"
+    "공업수학·수치해석":
+      - "공업수학-1"
+      - "공업수학-2"
+      - "공업수학-해설"
+      - "수치해석"
+    "통계학":
+      - "수리통계학"
+  "9. 기술 면접·코딩 테스트":
+    "면접 문제집":
+      - "100-Interview-Questions-Data-Structures-and-Algorithms"
+      - "100-Interview-Questions-Java-Collections"
+      - "100-Interview-Questions-Java-Spring-Framework"
+      - "100-Interview-Questions-Software-Engineer"
+      - "100-Interview-Questions-Spring-Boot-And-Hibernate"
+      - "100-interview-Questions-Java-JDBC"
+      - "기술-면접-대비-CS전공-핵심요약집"
+      - "System-Design-Interview"
+    "코딩 테스트":
+      - "95가지-파이썬-알고리즘-인터뷰"
+      - "Ace-the-Coding-Interview"
+      - "cracking-the-coding-interview"
+      - "Java-Coding-Interview-262문제"
+      - "프로그래머스-코딩테스트-문제-풀이-전략-자바편"
+  "10. IT 자격증":
+    "정보보안기사":
+      - "정보-보안-기사-요약집-용어"
+      - "정보-보안-기사-필기-이론편-02"
+      - "정보-보안-기사-필기-이론편"
+      - "정보-보안-기사-핵심기출-1200"
+    "리눅스마스터":
+      - "리마1급기본서이론서"
+      - "리눅스마스터1급2권문제집"
+    "컴퓨터일반·컴활":
+      - "박미진-컴퓨터-일반"
+      - "컴퓨터-활용-능력-1급"
+  "11. 부동산·감정평가·법":
+    "감정평가사":
+      - "감정평가사실무2차기본서"
+      - "감정평가사2차감정평가실무"
+      - "감정평가사2차기본문제1권"
+      - "감정평가사2차기본문제2권"
+      - "감정평가사2차기본문제3권"
+      - "감정평가사실무연습2차기출문제1권"
+      - "감정평가실무연습2차기출문제2권"
+      - "감정평가사실무연습2차종합문제1권"
+      - "감정평가사실무연습2차종합문제2권"
+    "부동산 개발·토지보상":
+      - "쉽게-익히는-부동산개발사업"
+      - "부동산-pf-개발사업법"
+      - "도시개발법-해설"
+      - "환지수용보상도시개발법해설"
+      - "공익사업토지수용보상금아는만큼더받는다"
+    "법률·법문서":
+      - "정보-공개법"
+      - "법률문장-어떻게-쓸-것인가"
+      - "신-법문서-작성"
+  "12. 건축·건설 관리":
+    "건축 자격증":
+      - "건축기사4주완성"
+      - "실내-건축기사"
+    "건설 사업 관리":
+      - "계약-클레임-리스크-관리"
+      - "공정-생산성-사업비-관리-경제성-분석"
+      - "설계정보-관리-가치공학-LCC"
+      - "품질-안전-환경-관리"
+  "13. 경영·금융·회계":
+    "회계(재경관리사)":
+      - "재경관리사-재무"
+      - "재경관리사-세무회계"
+      - "재경관리사-원가관리"
+      - "재경관리사-문제풀이"
+    "보험·금융·핀테크":
+      - "보험계리사1차한권으로끝내기-1"
+      - "보험계리사1차한권으로끝내기-2"
+      - "보험계리사-5"
+      - "핀테크-규제와-실무-1"
+      - "핀테크-규제와-실무-2"
+    "경영 관리·리스크":
+      - "기업업무-리스크-매니지먼트"
+      - "스마트-연간-사업-계획"
+    "호텔 경영":
+      - "최신-호텔-경영-관리론"
+      - "호텔-시설-관리론"
+      - "호텔에-관한-거의-모든것"
+    "보건의료":
+      - "보건의료정보학"
+  "14. 학습·글쓰기·교양":
+    "학습법·지식 관리":
+      - "How-We-Learn-우리의-뇌는-어떻게-배우는가"
+      - "Building-a-second-brain"
+      - "Second-brain-boost"
+    "글쓰기·문서화":
+      - "개발자를-위한-글쓰기-가이드"
+      - "개발자의-글쓰기"
+      - "Docs-for-Developers"
+      - "책-읽고-글쓰기"
+      - "한번에-통과하는-논문"
+    "교양 과학":
+      - "클래식-파인만"
+  "15. 어학":
+    "영어 어휘":
+      - "WORD-SMART-1+2"
+      - "WORD-SMART-BASIC"
+      - "토익보카"
+  "16. 논문(Saved from Chrome)":
+    "분산 시스템·보안":
+      - "Time, clocks, and the ordering of events in a distributed system"
+      - "Microsoft Word - sosp067-decandia1"
+      - "Reflections on trusting trust"
+    "AI·ML":
+      - "1350_Pre_trained_Large_Languag"
+      - "2312.00752v2"
+      - "2010.08895v3"
+      - "Towards a Science of Scaling Agent Systems"
+      - "A Fourier Explanation of AI-music Artifacts"
+    "수치 알고리즘":
+      - "S0025-5718-1965-0178586-1"
+    "미확인 arXiv":
+      - "2406.10254v1"
+      - "2410.22269v1"
+
+# 제목 → 비고 (선택)
+notes:
+  "Microsoft Word - sosp067-decandia1": "Dynamo: Amazon's Highly Available Key-value Store (SOSP 2007)"
+  "Reflections on trusting trust": "Ken Thompson, 1984 튜링상 강연"
+  "S0025-5718-1965-0178586-1": "Cooley–Tukey FFT (Mathematics of Computation, 1965)"
+  "Time, clocks, and the ordering of events in a distributed system": "Leslie Lamport, 1978"
+  "2312.00752v2": "Mamba: Linear-Time Sequence Modeling with Selective State Spaces (arXiv 2312.00752)"
+  "2010.08895v3": "Fourier Neural Operator (arXiv 2010.08895)"
+  "1350_Pre_trained_Large_Languag": "사전학습 LLM 관련 논문(파일명 잘림)"
+  "2406.10254v1": "arXiv 2406.10254 — 제목 확인 필요"
+  "2410.22269v1": "arXiv 2410.22269 — 제목 확인 필요"
+  "A/B-테스트": "파일명이 'A/B-테스트'라 드라이브 경로상 'A' 폴더처럼 보임"
+  "Pro-GIt-공식문서Pdf로-대체할것": "파일명에 '공식문서 PDF로 대체할것' 메모"
+  "클래식-파인만": "옛 파일명에 '누락있음' 표기가 있었음(내용 누락 가능)"
+  "박미진-컴퓨터-일반": "공무원 컴퓨터일반"
