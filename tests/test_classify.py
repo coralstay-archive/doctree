@@ -278,6 +278,14 @@ class TestMigratedCategories(unittest.TestCase):
         for k in self.cats.notes:
             self.assertIn(k, self.cats.index)
 
+    def test_kbi_7_1_mamba2_paper_classified_with_note(self):
+        """KBI-7#1 KBI-7#B1 2405.21060v1(Mamba-2)은 16. 논문 > AI·ML에 있고 비고가 붙어 있다."""
+        place = ("16. 논문(Saved from Chrome)", "AI·ML")
+        self.assertEqual(assign(_rec("2405.21060v1.pdf"), self.cats), place)
+        self.assertEqual(assign(_rec("2312.00752v2.pdf"), self.cats), place)  # 기존 Mamba와 같은 곳
+        self.assertEqual(self.cats.note("2405.21060v1.pdf"),
+                         "Transformers are SSMs (Mamba-2, arXiv 2405.21060)")
+
 
 if __name__ == "__main__":
     unittest.main()
