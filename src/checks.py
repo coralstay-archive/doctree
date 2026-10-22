@@ -1,0 +1,121 @@
+"""드라이브 정리용 점검: 중복·파일명 경고 (KBI-5).
+
+모든 점검은 레코드 목록만 읽는 순수 함수다. 드라이브 API를 호출하지 않고,
+입력 레코드를 수정하지 않는다 (B2).
+"""
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List
+
+from src.classify import title_key
+
+Record = Dict
+
+
+@dataclass
+class CheckWarning:
+    """점검 경고 하나. kind는 안정적인 식별 문자열, files는 관련 레코드, message는 한국어 설명."""
+
+    kind: str
+    files: List[Record] = field(default_factory=list)
+    message: str = ""
+
+
+def _path(rec: Record) -> str:
+    folder = rec.get("folder_path") or ""
+    name = rec.get("name") or ""
+    return f"{folder}/{name}" if folder else name
+
+
+def _order(w: "CheckWarning"):
+    return (_path(w.files[0]), w.files[0].get("id") or "")
+
+
+def _sorted(recs: Iterable[Record]) -> List[Record]:
+    return sorted(recs, key=lambda r: (_path(r), r.get("id") or ""))
+
+
+def _paths(recs: Iterable[Record]) -> str:
+    return ", ".join(_path(r) for r in recs)
+
+
+def find_exact_duplicates(records: Iterable[Record]) -> List[CheckWarning]:
+    """MD5가 같은 파일 묶음마다 '완전 중복' 경고. MD5가 빈 파일은 묶지 않는다 (B1: 이름 무관)."""
+    groups: Dict[str, List[Record]] = defaultdict(list)
+    for rec in records:
+        md5 = rec.get("md5")
+        if md5:
+            groups[md5].append(rec)
+    warnings = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        files = _sorted(members)
+        warnings.append(CheckWarning(
+            kind="exact_duplicate",
+            files=files,
+            message=f"완전 중복 {len(files)}개 (MD5 동일): {_paths(files)}",
+        ))
+    return sorted(warnings, key=_order)
+
+
+def find_same_title_different_content(records: Iterable[Record]) -> List[CheckWarning]:
+    """제목 키가 같지만 MD5 값이 2종 이상인 묶음마다 '동명 다른 파일' 경고.
+
+    묶음 전체가 MD5 하나를 공유하면 완전 중복(find_exact_duplicates)으로만 보고한다.
+    MD5가 빈 파일은 내용을 알 수 없으므로 별도 값('')으로 센다.
+    """
+    groups: Dict[str, List[Record]] = defaultdict(list)
+    for rec in records:
+        groups[title_key(rec.get("name") or "")].append(rec)
+    warnings = []
+    for members in groups.values():
+        if len(members) < 2 or len({m.get("md5") or "" for m in members}) < 2:
+            continue
+        files = _sorted(members)
+        warnings.append(CheckWarning(
+            kind="same_title_different_content",
+            files=files,
+            message=f"동명 다른 파일 {len(files)}개 (제목 같고 MD5 다름): {_paths(files)}",
+        ))
+    return sorted(warnings, key=_order)
+
+
+_FILENAME_KINDS = ("missing_pdf_extension", "copy_of_prefix", "surrounding_whitespace")
+
+
+def find_filename_issues(records: Iterable[Record]) -> List[CheckWarning]:
+    """파일별 파일명 점검: .pdf 확장자 누락, 'Copy of ' 접두어, 앞뒤 공백.
+
+    결과는 종류(_FILENAME_KINDS 순서) → 경로 순으로 정렬한다.
+    """
+    found: Dict[str, List[CheckWarning]] = {k: [] for k in _FILENAME_KINDS}
+    for rec in records:
+        name = rec.get("name") or ""
+        path = _path(rec)
+        if not name.lower().endswith(".pdf"):
+            found["missing_pdf_extension"].append(CheckWarning(
+                kind="missing_pdf_extension", files=[rec],
+                message=f"파일명에 .pdf 확장자가 없음: {path}"))
+        if name.startswith("Copy of "):
+            found["copy_of_prefix"].append(CheckWarning(
+                kind="copy_of_prefix", files=[rec],
+                message=f"파일명에 'Copy of ' 접두어가 있음: {path}"))
+        if name != name.strip():
+            found["surrounding_whitespace"].append(CheckWarning(
+                kind="surrounding_whitespace", files=[rec],
+                message=f"파일명 앞뒤에 공백이 있음: {path!r}"))
+    warnings: List[CheckWarning] = []
+    for kind in _FILENAME_KINDS:
+        warnings.extend(sorted(found[kind], key=_order))
+    return warnings
+
+
+def run_checks(records: Iterable[Record]) -> List[CheckWarning]:
+    """모든 점검을 실행해 종류 순(완전 중복 → 동명 다른 파일 → 파일명 점검) → 경로 순 경고 목록을 반환한다."""
+    records = list(records)
+    return (
+        find_exact_duplicates(records)
+        + find_same_title_different_content(records)
+        + find_filename_issues(records)
+    )
