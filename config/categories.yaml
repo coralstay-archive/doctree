@@ -302,6 +302,7 @@ categories:
     "AI·ML":
       - "1350_Pre_trained_Large_Languag"
       - "2312.00752v2"
+      - "2405.21060v1"
       - "2010.08895v3"
       - "Towards a Science of Scaling Agent Systems"
       - "A Fourier Explanation of AI-music Artifacts"
@@ -318,6 +319,7 @@ notes:
   "S0025-5718-1965-0178586-1": "Cooley–Tukey FFT (Mathematics of Computation, 1965)"
   "Time, clocks, and the ordering of events in a distributed system": "Leslie Lamport, 1978"
   "2312.00752v2": "Mamba: Linear-Time Sequence Modeling with Selective State Spaces (arXiv 2312.00752)"
+  "2405.21060v1": "Transformers are SSMs (Mamba-2, arXiv 2405.21060)"
   "2010.08895v3": "Fourier Neural Operator (arXiv 2010.08895)"
   "1350_Pre_trained_Large_Languag": "사전학습 LLM 관련 논문(파일명 잘림)"
   "2406.10254v1": "arXiv 2406.10254 — 제목 확인 필요"
