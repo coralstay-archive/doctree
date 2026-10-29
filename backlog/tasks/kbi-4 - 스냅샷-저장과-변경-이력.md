@@ -1,10 +1,10 @@
 ---
 id: KBI-4
 title: 스냅샷 저장과 변경 이력
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-10-21 09:37'
-updated_date: '2026-10-21 09:39'
+updated_date: '2026-10-27 15:58'
 labels:
   - ledger
 dependencies:
@@ -27,8 +27,8 @@ references:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 실행 시 ledger/snapshots/YYYY-MM-DD.json을 저장하고, 같은 날 재실행하면 덮어쓴다
-- [ ] #2 직전 스냅샷과 비교해 추가 · 삭제 · 이름 변경 · 폴더 이동 · 내용 변경(MD5)을 구분한다
-- [ ] #3 ledger/변경이력.md 맨 위에 실행 시각과 변경 블록을 추가하고, 변경이 없으면 '변경 없음'을 기록한다
-- [ ] #4 직전 스냅샷이 없으면 '최초 등록 N권'으로 기록한다
+- [x] #1 실행 시 ledger/snapshots/YYYY-MM-DD.json을 저장하고, 같은 날 재실행하면 덮어쓴다
+- [x] #2 직전 스냅샷과 비교해 추가 · 삭제 · 이름 변경 · 폴더 이동 · 내용 변경(MD5)을 구분한다
+- [x] #3 ledger/변경이력.md 맨 위에 실행 시각과 변경 블록을 추가하고, 변경이 없으면 '변경 없음'을 기록한다
+- [x] #4 직전 스냅샷이 없으면 '최초 등록 N권'으로 기록한다
 <!-- AC:END -->

@@ -4,16 +4,25 @@ credentials.json
 token.json
 client_secret*.json
 .drive_sync_token
+.vt_cache.json
+.local_contents_cache.json
 
-# Python
+# Python & Packaging Build Artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
-.pytest_cache/
+build/
+dist/
 
-# Ledger outputs (도서 목록 대장 산출물은 커밋하지 않음)
-ledger/
+# Test & Coverage Artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Snapshots (스냅샷 산출물은 커밋하지 않음)
+snapshots/
 
 # Legacy pipeline data / test output
 data/

@@ -1,0 +1,58 @@
+# 프로젝트 유형별 디렉토리 및 파일 구조 규격 정의서
+schema_version: 1
+
+profiles:
+  handcrafted:
+    content_dir: "contents"
+    content_data_dir: "content_data"
+    practice_dir: "practice"
+    directories:
+      - "contents"
+      - "content_data"
+      - "practice"
+      - "scripts"
+      - "tips"
+    required_files:
+      - ".gitignore"
+      - "README.md"
+      - "PROJECT_STRUCTURE.md"
+      - "PRACTICE_GUIDE.md"
+      - "scripts/run.sh"
+      - "scripts/test.sh"
+      - "scripts/locate.sh"
+      - "scripts/snippets.sh"
+      - "scripts/help.sh"
+    gitignore_entries:
+      - "/contents/"
+      - "/practice/"
+
+  research:
+    content_dir: "contents"
+    content_data_dir: "content_data"
+    directories:
+      - "contents"
+      - "content_data"
+      - "notes"
+      - "experiments"
+    required_files:
+      - ".gitignore"
+      - "README.md"
+      - "PROJECT_STRUCTURE.md"
+    gitignore_entries:
+      - "/contents/"
+
+  toolchain:
+    content_dir: "contents"
+    content_data_dir: "content_data"
+    directories:
+      - "contents"
+      - "docs"
+      - "scripts"
+      - "spec"
+    required_files:
+      - ".gitignore"
+      - "README.md"
+      - "install.sh"
+      - "uninstall.sh"
+    gitignore_entries:
+      - "/contents/"
