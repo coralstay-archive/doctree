@@ -4,8 +4,11 @@ import hashlib
 from pathlib import Path
 
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 
 from doctree.pdf_threat_audit.pdf_byte_inspector import (
+    DANGEROUS_PDF_TAGS,
     LocalPdfAudit,
     compute_sha256,
     discover_local_pdfs,
@@ -31,6 +34,10 @@ def test_compute_sha256_and_clean_pdf_inspection(tmp_path):
 
 
 def test_inspect_pdf_size_boundaries_and_partial_corruption(tmp_path):
+    # 존재하지 않는 경로 및 디렉터리 경로는 예외 없이 즉시 (False, False, ()) 반환
+    assert inspect_pdf_bytes(tmp_path / "missing.pdf") == (False, False, ())
+    assert inspect_pdf_bytes(tmp_path) == (False, False, ())
+
     # 경계값: 0바이트 및 7바이트(< 8) 파일은 즉시 (False, False, ()) 반환
     empty_pdf = tmp_path / "empty.pdf"
     empty_pdf.write_bytes(b"")
@@ -142,3 +149,96 @@ def test_discover_local_pdfs_deduplicates_and_skips_missing_or_non_pdf(tmp_path)
     # 동일 파일 직접 경로 중복 전달 + 상위 폴더 전달 시에도 중복 없이 정렬된 목록 반환
     found = discover_local_pdfs([missing_root, pdf1, pdf1, txt, sub])
     assert found == [pdf1, pdf2]
+
+
+@settings(max_examples=80, deadline=None)
+@given(
+    delim=st.sampled_from([b" ", b"\n", b"\r", b"\t", b"/", b"(", b"<", b"[", b">"]),
+    ident_suffix=st.from_regex(r"\A[A-Za-z0-9_]{1,12}\Z", fullmatch=True),
+    valid_header=st.booleans(),
+    valid_eof=st.booleans(),
+    tags=st.lists(
+        st.sampled_from([label for _, label in DANGEROUS_PDF_TAGS]),
+        max_size=3,
+        unique=True,
+    ).map(tuple),
+    vt_verdict=st.builds(
+        VtVerdict,
+        sha256=st.just("a" * 64),
+        status=st.sampled_from(list(VerdictStatus)),
+        malicious=st.integers(min_value=0, max_value=3),
+        suspicious=st.integers(min_value=0, max_value=3),
+    ),
+)
+@example(
+    delim=b"(",
+    ident_suffix="Engine_1",
+    valid_header=True,
+    valid_eof=True,
+    tags=(),
+    vt_verdict=VtVerdict(sha256="a" * 64, status=VerdictStatus.CLEAN, malicious=1, suspicious=0),
+)
+def test_property_fuzz_local_pdf_audit_and_tag_regex_invariants(
+    delim: bytes,
+    ident_suffix: str,
+    valid_header: bool,
+    valid_eof: bool,
+    tags: tuple[str, ...],
+    vt_verdict: VtVerdict,
+) -> None:
+    """DANGEROUS_PDF_TAGS 정규식의 구분자 탐지·식별자 접미어 오탐 배제 및 LocalPdfAudit.is_safe 불변식을 검증한다."""
+    suffix_bytes = ident_suffix.encode("ascii")
+    for pattern, label in DANGEROUS_PDF_TAGS:
+        raw_tag = b"/S /JS" if label == "/JS" else label.encode("ascii")
+        assert pattern.search(b"<< " + raw_tag + delim + b">>") is not None
+        assert pattern.search(b"<< " + raw_tag + suffix_bytes + b" >>") is None
+
+    audit = LocalPdfAudit(
+        path="/tmp/fuzz.pdf",
+        sha256="a" * 64,
+        valid_pdf_header=valid_header,
+        valid_pdf_eof=valid_eof,
+        dangerous_tags=tags,
+        vt_verdict=vt_verdict,
+    )
+    expected_vt_safe = (
+        vt_verdict.status not in (VerdictStatus.MALICIOUS, VerdictStatus.SUSPICIOUS)
+        and vt_verdict.malicious == 0
+        and vt_verdict.suspicious == 0
+    )
+    assert audit.is_safe is (valid_header and valid_eof and not tags and expected_vt_safe)
+
+
+def test_pdf_header_and_tail_window_exact_boundaries(tmp_path: Path) -> None:
+    """1024바이트 헤더 창·65536바이트 꼬리 창 경계값(Off-by-One) 및 주석 패딩 메타모픽 불변성을 검증한다."""
+    # 1) %PDF- 헤더가 정확히 1024바이트 창 내부 끝(offset 1019..1024)에 걸친 경우 -> True
+    header_in = tmp_path / "header_in.pdf"
+    header_in.write_bytes(b"X" * 1019 + b"%PDF-1.7\n%%EOF\n")
+    assert inspect_pdf_bytes(header_in)[:2] == (True, True)
+
+    # 2) %PDF- 헤더가 1020바이트 오프셋에서 시작해 1024바이트 창에서 1바이트 잘린 경우 -> False
+    header_out = tmp_path / "header_out.pdf"
+    header_out.write_bytes(b"X" * 1020 + b"%PDF-1.7\n%%EOF\n")
+    assert inspect_pdf_bytes(header_out)[:2] == (False, True)
+
+    # 3) %%EOF가 마지막 65536바이트 창 내부 시작점에 위치한 경우 -> True
+    tail_in = tmp_path / "tail_in.pdf"
+    tail_in.write_bytes(b"%PDF-1.7\n" + b"%%EOF" + b"A" * (65536 - 5))
+    assert inspect_pdf_bytes(tail_in)[:2] == (True, True)
+
+    # 4) %%EOF가 마지막 65536바이트 창 밖으로 1바이트 밀려난 경우 -> False
+    tail_out = tmp_path / "tail_out.pdf"
+    tail_out.write_bytes(b"%PDF-1.7\n" + b"%%EOF" + b"A" * (65536 - 4))
+    assert inspect_pdf_bytes(tail_out)[:2] == (True, False)
+
+    # 5) 메타모픽 관계: 무해한 PDF 주석(% comment) 패딩 시 판정 불변, 위험 태그(/S /JS) 삽입 시에만 unsafe 전이
+    base_pdf = tmp_path / "base.pdf"
+    padded_pdf = tmp_path / "padded.pdf"
+    tagged_pdf = tmp_path / "tagged.pdf"
+    _make_pdf(base_pdf, body=b"1 0 obj << /Type /Page >> endobj")
+    _make_pdf(padded_pdf, body=b"% benign comment\n1 0 obj << /Type /Page >> endobj\n% footer comment")
+    _make_pdf(tagged_pdf, body=b"% benign comment\n1 0 obj << /S /JS (alert) >> endobj")
+    assert inspect_pdf_bytes(base_pdf) == inspect_pdf_bytes(padded_pdf) == (True, True, ())
+    assert inspect_pdf_bytes(tagged_pdf) == (True, True, ("/JS",))
+
+

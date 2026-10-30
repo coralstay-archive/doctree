@@ -25,6 +25,7 @@ dev = [
     "coverage>=7.0.0",
     "pytest-bdd>=8.0.0",
     "pytest-html>=4.0.0",
+    "hypothesis>=6.0.0",
     "ruff>=0.8.0",
     "vulture>=2.14",
 ]
@@ -63,17 +64,30 @@ line-length = 120
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "B", "SIM", "ERA", "PIE", "ARG", "UP", "C4", "RET", "RUF", "I", "SLF"]
+select = ["E", "F", "W", "B", "SIM", "ERA", "PIE", "ARG", "UP", "C4", "C901", "PLR0912", "PLR0913", "PLR0915", "RET", "RUF", "I", "SLF", "PERF", "FURB"]
 ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 7
+
+[tool.ruff.lint.pylint]
+max-args = 7
+max-branches = 7
+max-statements = 50
 
 [tool.vulture]
 paths = ["src/doctree", "tests"]
 min_confidence = 60
-ignore_decorators = ["@given", "@when", "@then"]
+ignore_decorators = ["@given", "@when", "@then", "@initialize", "@rule", "@invariant"]
 ignore_names = [
+    "__dir__",
+    "__getattr__",
     "construct_mapping",
     "do_GET",
     "log_message",
     "message",
+    "modified_time",
+    "teardown",
+    "web_view_link",
     "help",
 ]

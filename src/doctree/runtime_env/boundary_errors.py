@@ -11,17 +11,28 @@ from urllib import request as urllib_request
 
 __all__ = [
     "AUTH_MISSING_MESSAGE",
+    "BOUNDARY_TO_EXTERNAL",
     "SNAPSHOT_PRESERVED_NOTICE",
     "BoundaryKind",
     "ClassificationError",
     "DoctreeBoundaryError",
     "DriveAuthError",
     "DriveListError",
+    "ExternalBoundary",
     "SecurityAuditError",
     "SnapshotStorageError",
     "coerce_boundary_error",
     "execute_json_http_get",
 ]
+
+
+class ExternalBoundary(StrEnum):
+    """프로세스가 외부 세계와 데이터를 주고받는 4대 물리·런타임 경계면."""
+
+    PROCESS_TERMINAL = "process_terminal"
+    NETWORK_API = "network_api"
+    FILESYSTEM = "filesystem"
+    SYSTEM_CLOCK = "system_clock"
 
 
 class BoundaryKind(StrEnum):
@@ -33,6 +44,18 @@ class BoundaryKind(StrEnum):
     FILESYSTEM = "filesystem"
     TAXONOMY = "taxonomy"
     SECURITY_AUDIT = "security_audit"
+
+
+BOUNDARY_TO_EXTERNAL: Final[Mapping[BoundaryKind, ExternalBoundary]] = MappingProxyType(
+    {
+        BoundaryKind.AUTH: ExternalBoundary.NETWORK_API,
+        BoundaryKind.DRIVE_API: ExternalBoundary.NETWORK_API,
+        BoundaryKind.THREAT_INTEL_API: ExternalBoundary.NETWORK_API,
+        BoundaryKind.FILESYSTEM: ExternalBoundary.FILESYSTEM,
+        BoundaryKind.TAXONOMY: ExternalBoundary.FILESYSTEM,
+        BoundaryKind.SECURITY_AUDIT: ExternalBoundary.FILESYSTEM,
+    }
+)
 
 
 _BOUNDARY_PREFIX: Final[Mapping[BoundaryKind, str]] = MappingProxyType(
@@ -51,6 +74,9 @@ AUTH_MISSING_MESSAGE: Final[str] = (
     "`doctree auth`를 먼저 실행하세요."
 )
 SNAPSHOT_PRESERVED_NOTICE: Final[str] = "기존 스냅샷은 그대로 두었습니다."
+_RAW_DETAIL_BOUNDARIES: Final[frozenset[BoundaryKind]] = frozenset(
+    {BoundaryKind.AUTH, BoundaryKind.SECURITY_AUDIT}
+)
 
 
 class DoctreeBoundaryError(Exception):
@@ -60,6 +86,7 @@ class DoctreeBoundaryError(Exception):
     일관된 구조로 보유하며 format_error()로 통일된 사용자 메시지를 생성한다.
     """
 
+    __slots__ = ()
     default_boundary: BoundaryKind = BoundaryKind.FILESYSTEM
 
     def __init__(
@@ -74,11 +101,14 @@ class DoctreeBoundaryError(Exception):
         self.boundary: BoundaryKind = boundary or self.default_boundary
         self.preserve_snapshot: bool = preserve_snapshot
 
+    @property
+    def external_boundary(self) -> ExternalBoundary:
+        """이 예외가 속한 상위 4대 외부 경계면(ExternalBoundary)을 반환한다."""
+        return BOUNDARY_TO_EXTERNAL[self.boundary]
+
     def format_error(self) -> str:
         """경계면 종류에 맞는 일관된 한국어 에러 메시지를 반환한다."""
-        if self.boundary == BoundaryKind.AUTH:
-            return self.detail
-        if self.boundary == BoundaryKind.SECURITY_AUDIT:
+        if self.boundary in _RAW_DETAIL_BOUNDARIES:
             return self.detail
         prefix = _BOUNDARY_PREFIX[self.boundary]
         if self.detail.startswith(f"{prefix}:"):
@@ -89,6 +119,7 @@ class DoctreeBoundaryError(Exception):
 class DriveAuthError(DoctreeBoundaryError, RuntimeError):
     """구글 드라이브 OAuth 2.0 / 서비스 계정 인증 경계 실패 (경계 ② 네트워크 소켓 & ③ 파일시스템)."""
 
+    __slots__ = ()
     default_boundary = BoundaryKind.AUTH
 
     def __init__(
@@ -103,24 +134,28 @@ class DriveAuthError(DoctreeBoundaryError, RuntimeError):
 class DriveListError(DoctreeBoundaryError, RuntimeError):
     """구글 드라이브 API 목록 조회(files.list) 경계 실패 (경계 ② 외부 네트워크 소켓)."""
 
+    __slots__ = ()
     default_boundary = BoundaryKind.DRIVE_API
 
 
 class ClassificationError(DoctreeBoundaryError, ValueError):
     """분류 체계 YAML 설정·스냅샷 스키마·엄격 모드 미분류 검증 경계 실패 (경계 ③ 로컬 파일시스템 데이터 스키마)."""
 
+    __slots__ = ()
     default_boundary = BoundaryKind.TAXONOMY
 
 
 class SnapshotStorageError(DoctreeBoundaryError, OSError):
     """로컬 스냅샷·설정·캐시·PDF 파일시스템 입출력 경계 실패 (경계 ③ 로컬 파일시스템 VFS)."""
 
+    __slots__ = ()
     default_boundary = BoundaryKind.FILESYSTEM
 
 
 class SecurityAuditError(DoctreeBoundaryError, RuntimeError):
     """위협 인텔리전스 해시 대조 또는 로컬 PDF 보안 감사 차단 경계 실패 (경계 ② 네트워크 API & ③ 파일시스템)."""
 
+    __slots__ = ()
     default_boundary = BoundaryKind.SECURITY_AUDIT
 
 
@@ -147,6 +182,9 @@ def coerce_boundary_error(
     )
 
 
+_MAX_HTTP_RESPONSE_BYTES: Final[int] = 10 * 1024 * 1024
+
+
 def execute_json_http_get(
     url: str,
     headers: Mapping[str, str],
@@ -163,10 +201,12 @@ def execute_json_http_get(
     - 그 외 HTTP 오류: (None, code, f"HTTP {code}")
     - 네트워크·타임아웃·JSON 파싱 오류: (None, None, str(error))
     """
-    req = urllib_request.Request(url, headers=dict(headers), method="GET")
+    if not url.startswith(("https://", "http://")):
+        return None, None, f"{service_name} 지원하지 않는 URL 스킴입니다: {url}"
     try:
+        req = urllib_request.Request(url, headers=dict(headers), method="GET")
         with urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+            raw = resp.read(_MAX_HTTP_RESPONSE_BYTES).decode("utf-8")
             body = json.loads(raw)
             if not isinstance(body, dict):
                 return None, None, f"{service_name} 응답 형식 오류: JSON 객체가 아닙니다."

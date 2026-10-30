@@ -19,27 +19,16 @@ profiles:
       - "PRACTICE_GUIDE.md"
       - "scripts/run.sh"
       - "scripts/test.sh"
+      - "scripts/reset.sh"
       - "scripts/locate.sh"
       - "scripts/snippets.sh"
       - "scripts/help.sh"
     gitignore_entries:
       - "/contents/"
-      - "/practice/"
-
-  research:
-    content_dir: "contents"
-    content_data_dir: "content_data"
-    directories:
-      - "contents"
-      - "content_data"
-      - "notes"
-      - "experiments"
-    required_files:
-      - ".gitignore"
-      - "README.md"
-      - "PROJECT_STRUCTURE.md"
-    gitignore_entries:
-      - "/contents/"
+      - "/content_data/"
+      - "practice/**/README.md"
+      - "practice/**/assets/"
+      - "practice/**/.skeleton/"
 
   toolchain:
     content_dir: "contents"

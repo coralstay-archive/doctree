@@ -1,15 +1,23 @@
 """Offline checks for the fixed taxonomy and explicit Drive-ID assignments."""
 
+import unicodedata
 from copy import deepcopy
 
 import pytest
 import yaml
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from doctree.content_taxonomy.category_classifier import (
+    Category,
+    ClassificationCatalog,
     ClassificationError,
+    ContentAssignment,
+    Subcategory,
     classify_records,
     load_catalog,
 )
+from doctree.doctree_cli.terminal_tree_renderer import format_classification_summary
 
 
 @pytest.fixture
@@ -310,3 +318,115 @@ def test_classify_records_defensively_copies_input_record_Against_caller_mutatio
     # 호출 측이 원본 dict를 사후 변경(mutate)하더라도 분류 결과 내부의 레코드는 오염되지 않는다.
     caller_record["name"] = "Mutated.pdf"
     assert result.contents[0].record["name"] == "Original.pdf"
+
+
+_FUZZ_CATALOG = ClassificationCatalog(
+    categories=(
+        Category(
+            id="cs",
+            name="컴퓨터 과학 기초",
+            subcategories=(
+                Subcategory(id="cs.algorithms", name="알고리즘·자료구조"),
+                Subcategory(id="cs.os", name="운영체제"),
+            ),
+        ),
+        Category(
+            id="programming",
+            name="프로그래밍",
+            subcategories=(
+                Subcategory(id="programming.python", name="Python"),
+                Subcategory(id="programming.cpp", name="C++"),
+            ),
+        ),
+    ),
+    assignments=(
+        ContentAssignment(file_id="reg-1", title="알고리즘 도서", category_id="cs.algorithms"),
+        ContentAssignment(file_id="reg-2", title="파이썬 도서", category_id="programming.python"),
+        ContentAssignment(file_id="reg-3", title="C++ 도서", category_id="programming.cpp"),
+    ),
+)
+
+_NONEMPTY_NAME_STRATEGY = st.text(min_size=1, max_size=24).filter(lambda s: bool(s.strip()))
+
+
+@st.composite
+def _permuted_records_strategy(draw: st.DrawFn) -> tuple[list[dict], list[dict]]:
+    rec_map = draw(
+        st.dictionaries(
+            keys=st.sampled_from(["reg-1", "reg-2", "reg-3", "unreg-a", "unreg-b", "unreg-c"]),
+            values=st.tuples(_NONEMPTY_NAME_STRATEGY, st.text(max_size=20)),
+            max_size=6,
+        )
+    )
+    records = [
+        {"id": fid, "name": name, "folder_path": folder}
+        for fid, (name, folder) in rec_map.items()
+    ]
+    permuted = draw(st.permutations(records))
+    return records, list(permuted)
+
+
+@settings(max_examples=100, deadline=None)
+@given(pair=_permuted_records_strategy())
+def test_property_fuzz_classify_records_conservation_and_permutation_invariance(
+    pair: tuple[list[dict], list[dict]],
+) -> None:
+    """입력 레코드 순서 치환(Permutation) 및 미등록 파일 포함 시에도 집합 보존 법칙과 분류 트리 출력 순서 불변성을 보장한다."""
+    records, permuted = pair
+    res = classify_records(records, _FUZZ_CATALOG, strict=False)
+    res_perm = classify_records(permuted, _FUZZ_CATALOG, strict=False)
+
+    classified_count = sum(1 for item in res.contents if item.category_id is not None)
+    unclassified_count = len(res.unclassified)
+    assert classified_count + unclassified_count == len(records)
+    assert len(res_perm.unclassified) == unclassified_count
+    assert [cat.id for cat in res_perm.catalog.categories] == ["cs", "programming"]
+    assert format_classification_summary(res) == format_classification_summary(res_perm)
+
+
+def test_nfc_nfd_file_id_canonicalization_and_assignment_promotion_metamorphic(
+    documents,
+    load_documents,
+) -> None:
+    """NFD/NFC file_id 정규화 중복 차단·매칭 일관성 및 미분류 배정 승격 메타모픽 관계를 검증한다."""
+    categories, contents = documents
+    nfc_id = "한글-id"
+    nfd_id = unicodedata.normalize("NFD", nfc_id)
+    assert nfc_id != nfd_id
+
+    # 1) content_category_map.yaml 내 NFD/NFC 동일 file_id 중복 등록 차단
+    dup_contents = deepcopy(contents)
+    dup_contents["contents"] = [
+        {"file_id": nfc_id, "title": "A", "category_id": "cs.algorithms"},
+        {"file_id": nfd_id, "title": "B", "category_id": "cs.os"},
+    ]
+    with pytest.raises(ClassificationError, match="중복 파일 ID"):
+        load_documents(categories, dup_contents)
+
+    # 2) classify_records 내 NFD/NFC 동일 record["id"] 중복 차단
+    catalog = load_documents(categories, contents)
+    with pytest.raises(ClassificationError, match="중복 파일 ID"):
+        classify_records(
+            [{"id": nfc_id, "name": "A.pdf"}, {"id": nfd_id, "name": "B.pdf"}],
+            catalog,
+        )
+
+    # 3) NFC로 등록된 ContentAssignment와 NFD record["id"] 매칭 및 미분류 승격 메타모픽 관계
+    records = [
+        {"id": "drive-known", "name": "Known.pdf"},
+        {"id": nfd_id, "name": "Unclassified.pdf"},
+    ]
+    before = classify_records(records, catalog, strict=False)
+    assert len(before.unclassified) == 1
+
+    promoted_catalog = ClassificationCatalog(
+        categories=catalog.categories,
+        assignments=(
+            *catalog.assignments,
+            ContentAssignment(file_id=nfc_id, title="승격 도서", category_id="cs.os"),
+        ),
+    )
+    after = classify_records(records, promoted_catalog, strict=True)
+    assert len(after.unclassified) == 0
+    assert [item.category_id for item in after.contents] == ["cs.algorithms", "cs.os"]
+

@@ -4,15 +4,54 @@ import dataclasses
 import importlib
 import os
 import subprocess
+import unicodedata
 import unittest
 from pathlib import Path
 from types import MappingProxyType
 
+import hypothesis
+from hypothesis import example, given
+from hypothesis import strategies as st
+
 import doctree.runtime_env.workspace_settings as settings
 from doctree.content_taxonomy.practice_kata_builder import SUPPORTED_LANG_MAP
-from doctree.runtime_env.workspace_settings import BASE_DIR, WorkspaceSettings
+from doctree.runtime_env.workspace_settings import (
+    BASE_DIR,
+    DEFAULT_TOC_CHAPTER,
+    WorkspaceSettings,
+    build_default_toc_entry,
+    format_record_path,
+    normalize_nfc,
+    sanitize_dot_label,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
+_CONTROL_FLOW_NODES = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try)
+
+
+def _max_control_nesting(node: ast.AST, current: int = 0) -> int:
+    """AST 노드의 최대 제어문(if/for/while/try) 중첩 깊이를 계산한다(elif 체인은 동일 깊이로 평탄화)."""
+    best = current
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        is_elif = isinstance(node, ast.If) and isinstance(child, ast.If) and node.orelse == [child]
+        next_depth = current if is_elif else current + int(isinstance(child, _CONTROL_FLOW_NODES))
+        best = max(best, _max_control_nesting(child, next_depth))
+    return best
+
+
+def _iter_routine_nodes(root_dir: Path) -> list[tuple[Path, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """지정 디렉터리 하위 모든 파이썬 파일에서 함수·비동기 함수 AST 노드를 추출한다."""
+    routines: list[tuple[Path, ast.FunctionDef | ast.AsyncFunctionDef]] = []
+    for py_file in sorted(root_dir.rglob("*.py")):
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        routines.extend(
+            (py_file, node)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        )
+    return routines
 
 
 class TestSettings(unittest.TestCase):
@@ -35,8 +74,10 @@ class TestSettings(unittest.TestCase):
         }
         cfg = WorkspaceSettings.from_env(env=env_input, base_dir=ROOT)
         env_input["DOCTREE_SNAPSHOTS_DIR"] = "/tmp/mutated-after"
+        self.assertEqual(cfg.base_dir, ROOT)
         self.assertEqual(cfg.snapshots_dir, "/tmp/custom-snaps")
         self.assertEqual(cfg.vt_cache_file, "/tmp/custom-snaps/.vt_cache.json")
+        self.assertEqual(cfg.local_contents_cache_file, "/tmp/custom-snaps/.local_contents_cache.json")
         self.assertEqual(cfg.google_service_account_file, "/tmp/sa.json")
         self.assertEqual(cfg.google_drive_folder_id, "folder-xyz")
         self.assertEqual(cfg.category_tree_file, "/tmp/cats.yaml")
@@ -48,6 +89,69 @@ class TestSettings(unittest.TestCase):
         self.assertFalse(hasattr(cfg, "__dict__"))
         with self.assertRaises(dataclasses.FrozenInstanceError):
             cfg.snapshots_dir = "/tmp/mutated"  # type: ignore[misc]
+        for bad_chunk in (0, -1, True):
+            with self.assertRaises(ValueError):
+                settings.compute_sha256(__file__, chunk_size=bad_chunk)  # type: ignore[arg-type]
+        self.assertEqual(settings.normalize_nfc(None), "")
+        self.assertEqual(settings.normalize_nfc(0), "0")
+        self.assertEqual(settings.normalize_nfc(False), "False")
+        self.assertEqual(settings.format_record_path({"folder_path": "   /  ", "name": "a.pdf"}), "a.pdf")
+        self.assertEqual(settings.sanitize_dot_label("A|{B}<C>\u200b"), "A/(B)[C] ")
+
+    def test_all_domain_classes_define_explicit_memory_slots(self):
+        """src/doctree/ 내 모든 클래스(StrEnum·TypedDict 제외)는 __slots__ 또는 slots=True를 명시하여 불필요한 슬롯 낭비를 막는다."""
+        pkg_root = ROOT / "src" / "doctree"
+        for py_file in sorted(pkg_root.rglob("*.py")):
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                bases = {ast.unparse(b) for b in node.bases}
+                if bases & {"StrEnum", "TypedDict"}:
+                    continue
+                decorators = [ast.unparse(d) for d in node.decorator_list]
+                has_dataclass_slots = any("slots=True" in dec for dec in decorators)
+                has_explicit_slots = any(
+                    isinstance(stmt, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "__slots__" for t in stmt.targets)
+                    for stmt in node.body
+                )
+                self.assertTrue(
+                    has_dataclass_slots or has_explicit_slots,
+                    f"{py_file.name}:{node.lineno} class {node.name} must define __slots__ or @dataclass(..., slots=True)",
+                )
+
+    def test_all_routines_respect_code_complete_parameter_and_statement_bounds(self):
+        """전 함수·메서드는 매개변수 7개 이하·제어문 중첩 3단 이하·도메인 루틴 길이 65줄 이하(Code Complete 2 Ch.7)를 준수한다."""
+        pkg_root = ROOT / "src" / "doctree"
+        for py_file, node in _iter_routine_nodes(pkg_root) + _iter_routine_nodes(ROOT / "tests"):
+            param_count = (
+                len(node.args.posonlyargs)
+                + len(node.args.args)
+                + len(node.args.kwonlyargs)
+                + int(node.args.vararg is not None)
+                + int(node.args.kwarg is not None)
+            )
+            self.assertLessEqual(
+                param_count,
+                7,
+                f"{py_file.name}:{node.lineno} {node.name}() has {param_count} parameters (> 7)",
+            )
+            if not py_file.is_relative_to(pkg_root):
+                continue
+            nesting = _max_control_nesting(node)
+            self.assertLessEqual(
+                nesting,
+                3,
+                f"{py_file.name}:{node.lineno} {node.name}() has control nesting depth {nesting} (> 3)",
+            )
+            if not node.name.startswith("_register_"):
+                line_span = (node.end_lineno or node.lineno) - node.lineno + 1
+                self.assertLessEqual(
+                    line_span,
+                    65,
+                    f"{py_file.name}:{node.lineno} {node.name}() spans {line_span} lines (> 65)",
+                )
 
     def test_dotenv_import_error_fallback(self):
         """python-dotenv가 없어도 workspace_settings가 정상 로드된다."""
@@ -151,6 +255,7 @@ class TestSelfDocumentingNamingAndSymmetry(unittest.TestCase):
             "doctree.content_taxonomy.category_classifier",
             "doctree.content_taxonomy.duplicate_and_naming_linter",
             "doctree.content_taxonomy.practice_kata_builder",
+            "doctree.content_taxonomy.snippet_registry",
             "doctree.pdf_threat_audit",
             "doctree.pdf_threat_audit.pdf_byte_inspector",
             "doctree.pdf_threat_audit.pdf_page_ingestor",
@@ -160,16 +265,58 @@ class TestSelfDocumentingNamingAndSymmetry(unittest.TestCase):
             "doctree.doctree_cli.terminal_tree_renderer",
         ):
             mod = importlib.import_module(name)
-            if name == "doctree" or name.count(".") == 2:
+            if name == "doctree" or name.count(".") in (1, 2):
                 self.assertTrue(hasattr(mod, "__all__"), f"{name} must define __all__")
             if hasattr(mod, "__all__"):
                 for exported in mod.__all__:
                     self.assertTrue(hasattr(mod, exported), f"{name}.{exported}")
                     if exported != "__version__":
                         self.assertFalse(exported.startswith("_"), f"{name}.{exported} must be public")
+            if name.count(".") == 1:
+                self.assertTrue(set(mod.__all__).issubset(set(dir(mod))))
+                with self.assertRaises(AttributeError):
+                    _ = mod.non_existent_symbol_xyz
+
+    def _assert_import_node_respects_boundaries(
+        self,
+        py_file: Path,
+        layer: str,
+        node: ast.ImportFrom,
+    ) -> None:
+        if not node.module or not node.module.startswith("doctree"):
+            return
+        target_parts = node.module.split(".")
+        target_layer = target_parts[1] if len(target_parts) > 1 else "root"
+
+        if layer == "runtime_env":
+            self.assertEqual(
+                target_layer,
+                "runtime_env",
+                f"runtime_env 모듈({py_file.name})이 상위 계층({node.module})을 참조함",
+            )
+        if layer in {"drive_sync", "content_taxonomy", "pdf_threat_audit"}:
+            self.assertIn(
+                target_layer,
+                {layer, "runtime_env"},
+                f"도메인 모듈({layer}/{py_file.name})이 허용되지 않은 계층({node.module})을 참조함",
+            )
+
+        target_mod = importlib.import_module(node.module)
+        target_all = set(getattr(target_mod, "__all__", ()))
+        for alias in node.names:
+            if alias.name != "__version__":
+                self.assertFalse(
+                    alias.name.startswith("_"),
+                    f"{py_file.name}에서 비공개 심볼 {node.module}.{alias.name}를 import함",
+                )
+            self.assertIn(
+                alias.name,
+                target_all,
+                f"{py_file.name}에서 __all__ 밖의 심볼 {node.module}.{alias.name}를 import함",
+            )
 
     def test_module_encapsulation_and_layer_import_boundaries(self):
-        """모든 모듈은 공개 심볼(__all__)만 외부에 노출·참조하며 계층 간 단방향 의존성 규칙을 지킨다."""
+        """모든 모듈은 공개 심볼(__all__)만 외부에 노출·참조하며 계층 간 단방향 의존성, 무결합 및 모듈 전역 불변성을 지킨다."""
         self.assertIsInstance(SUPPORTED_LANG_MAP, MappingProxyType)
         with self.assertRaises(TypeError):
             SUPPORTED_LANG_MAP["rb"] = "Ruby"  # type: ignore[index]
@@ -178,42 +325,20 @@ class TestSelfDocumentingNamingAndSymmetry(unittest.TestCase):
         for py_file in sorted(pkg_root.rglob("*.py")):
             rel_parts = py_file.relative_to(pkg_root).parts
             layer = rel_parts[0] if len(rel_parts) > 1 else "root"
+            mod_name = ".".join(py_file.relative_to(ROOT / "src").with_suffix("").parts)
+            mod = importlib.import_module(mod_name)
+            for attr_name, attr_val in vars(mod).items():
+                if not attr_name.startswith("__"):
+                    self.assertNotIsInstance(
+                        attr_val,
+                        (list, dict, set),
+                        f"{mod_name}.{attr_name} must use immutable container (tuple/MappingProxyType/frozenset)",
+                    )
+
             tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
-
             for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("doctree"):
-                    target_parts = node.module.split(".")
-                    target_layer = target_parts[1] if len(target_parts) > 1 else "root"
-
-                    # 1) 최하위 기반 계층(runtime_env)은 상위 도메인·CLI 계층을 절대 역참조하지 않는다
-                    if layer == "runtime_env":
-                        self.assertEqual(
-                            target_layer,
-                            "runtime_env",
-                            f"runtime_env 모듈({py_file.name})이 상위 계층({node.module})을 참조함",
-                        )
-                    # 2) 도메인 계층은 최상위 진입점(doctree_cli)을 역참조하지 않는다
-                    if layer in {"drive_sync", "content_taxonomy", "pdf_threat_audit"}:
-                        self.assertNotEqual(
-                            target_layer,
-                            "doctree_cli",
-                            f"도메인 모듈({py_file.name})이 CLI 계층({node.module})을 역참조함",
-                        )
-
-                    # 3) 다른 doctree 모듈에서 import하는 모든 심볼은 대상 모듈의 __all__에 등록된 공개 심볼이어야 한다
-                    target_mod = importlib.import_module(node.module)
-                    target_all = set(getattr(target_mod, "__all__", ()))
-                    for alias in node.names:
-                        if alias.name != "__version__":
-                            self.assertFalse(
-                                alias.name.startswith("_"),
-                                f"{py_file.name}에서 비공개 심볼 {node.module}.{alias.name}를 import함",
-                            )
-                        self.assertIn(
-                            alias.name,
-                            target_all,
-                            f"{py_file.name}에서 __all__ 밖의 심볼 {node.module}.{alias.name}를 import함",
-                        )
+                if isinstance(node, ast.ImportFrom):
+                    self._assert_import_node_respects_boundaries(py_file, layer, node)
 
 
 class TestSnapshotsIgnoredAndNoLedger(unittest.TestCase):
@@ -234,6 +359,48 @@ class TestSnapshotsIgnoredAndNoLedger(unittest.TestCase):
             capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+@hypothesis.settings(max_examples=80, deadline=None)
+@given(
+    raw_val=st.one_of(st.none(), st.booleans(), st.integers(), st.text(max_size=60)),
+    folder=st.text(max_size=40),
+    name=st.text(max_size=40),
+    page_num=st.integers(min_value=1, max_value=5000),
+)
+@example(raw_val=None, folder="", name="", page_num=1)
+@example(
+    raw_val="A|{B}<C>\"'\\\n\r\t\x00\u200b```",
+    folder="/   /  /",
+    name="  한글.pdf  ",
+    page_num=1,
+)
+@example(raw_val=False, folder="CS/DB", name="튜닝.pdf", page_num=12)
+def test_property_fuzz_workspace_settings_string_and_path_helpers(
+    raw_val: object,
+    folder: str,
+    name: str,
+    page_num: int,
+) -> None:
+    """normalize_nfc, sanitize_dot_label, format_record_path, build_default_toc_entry의 멱등성·구분자 제거·경로 정규화 불변식을 검증한다."""
+    nfc = normalize_nfc(raw_val)
+    assert normalize_nfc(nfc) == nfc
+    assert unicodedata.is_normalized("NFC", nfc)
+
+    label = sanitize_dot_label(str(raw_val or ""))
+    assert sanitize_dot_label(label) == label
+    assert all(ch not in label for ch in ("|", "{", "}", "<", ">", '"', "\\", "\n", "\r", "\t"))
+    assert "```" not in label
+    assert all(ch.isprintable() for ch in label)
+
+    rec_path = format_record_path({"folder_path": folder, "name": name})
+    assert unicodedata.is_normalized("NFC", rec_path)
+    assert not rec_path.startswith("/")
+
+    toc = build_default_toc_entry(nfc, page_num, chapter_title="", section_title="   ")
+    assert toc["page"] == page_num
+    assert toc["chapter"] == DEFAULT_TOC_CHAPTER
+    assert toc["section"] == f"{page_num:02d}_페이지_핵심"
 
 
 if __name__ == "__main__":

@@ -1,19 +1,36 @@
 """스냅샷 저장과 직전 스냅샷 비교 검증."""
 import json
+import shutil
 import tempfile
+import unicodedata
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
+from hypothesis.stateful import (
+    RuleBasedStateMachine,
+    invariant,
+    rule,
+    run_state_machine_as_test,
+)
 
 from doctree.drive_sync.snapshot_diff_tracker import (
+    KST,
     Change,
     Changes,
     change_summary,
     diff_snapshots,
     load_latest_snapshot,
+    load_snapshot_records,
     record_run,
     save_snapshot,
+    snapshot_date,
 )
+from doctree.runtime_env.boundary_errors import SnapshotStorageError
 
 
 def _rec(id_, name, folder="IT/개발", sha256="m", size=1):
@@ -247,16 +264,164 @@ class TestRecordRun(unittest.TestCase):
             "추가 1 · 삭제 2 · 이름 변경 3 · 폴더 이동 4 · 내용 변경 5",
         )
 
-        # 4) Change 및 RunResult 불변(frozen) 검증 및 diff_snapshots 반환 객체 수정 시 원본 입력 비오염 검증
+        # 4) Change, Changes 및 RunResult 불변(frozen) 검증 및 diff_snapshots 반환 객체 수정 시 원본 입력 비오염 검증
         with self.assertRaises(dataclasses.FrozenInstanceError):
             ch_size.content_changed[0].new = "mutated"  # type: ignore[misc]
         with self.assertRaises(dataclasses.FrozenInstanceError):
+            ch_size.added = []  # type: ignore[misc]
+        with self.assertRaises(dataclasses.FrozenInstanceError):
             run_all.total = 999  # type: ignore[misc]
+
+        bad_elem_snap = self.snapshots / "2026-10-22.json"
+        bad_elem_snap.write_text('{"count": 1, "records": ["not-a-dict"]}', encoding="utf-8")
+        with self.assertRaises(SnapshotStorageError):
+            load_snapshot_records(bad_elem_snap)
+
+        with self.assertRaises(TypeError):
+            snapshot_date(date(2026, 10, 21))  # type: ignore[arg-type]
+
+        for bad_records in (
+            ["not-a-mapping"],
+            [{"name": "no_id.pdf"}],
+            [{"id": 123, "name": "non_str_id.pdf"}],
+            [_rec("dup", "A.pdf"), _rec("dup", "B.pdf")],
+        ):
+            with self.assertRaises(SnapshotStorageError):
+                diff_snapshots(bad_records, [])  # type: ignore[arg-type]
 
         caller_new = [_rec("x", "Orig.pdf")]
         diff_res = diff_snapshots([], caller_new)
         diff_res.added[0]["name"] = "MutatedInResult.pdf"
         self.assertEqual(caller_new[0]["name"], "Orig.pdf")
+
+
+_SNAPSHOT_ENTRY_STRATEGY = st.tuples(
+    st.text(max_size=24),
+    st.text(max_size=24),
+    st.sampled_from(["", "a" * 64, "B" * 64, "  c" + "0" * 63 + "  "]),
+    st.integers(min_value=0, max_value=100_000),
+)
+_SNAPSHOT_DICT_STRATEGY = st.dictionaries(
+    keys=st.sampled_from([f"파일-{idx}" for idx in range(10)]),
+    values=_SNAPSHOT_ENTRY_STRATEGY,
+    max_size=8,
+)
+
+
+def _build_snapshot_from_map(raw_map: dict[str, tuple[str, str, str, int]]) -> list[dict]:
+    return [
+        _rec(file_id, name, folder=folder, sha256=sha, size=size)
+        for file_id, (name, folder, sha, size) in raw_map.items()
+    ]
+
+
+@settings(max_examples=100, deadline=None)
+@given(map_a=_SNAPSHOT_DICT_STRATEGY, map_b=_SNAPSHOT_DICT_STRATEGY)
+def test_property_fuzz_diff_snapshots_algebraic_invariants(
+    map_a: dict[str, tuple[str, str, str, int]],
+    map_b: dict[str, tuple[str, str, str, int]],
+) -> None:
+    """임의의 두 스냅샷(A, B)에 대해 반사성(Reflexivity)·대칭성(Symmetry)·상호 배타성(Mutual Exclusivity) 대수적 불변식을 검증한다."""
+    snap_a = _build_snapshot_from_map(map_a)
+    snap_b = _build_snapshot_from_map(map_b)
+    snap_a_nfd = [
+        {
+            **r,
+            "id": f"  {unicodedata.normalize('NFD', r['id'])}  ",
+            "name": unicodedata.normalize("NFD", r["name"]),
+            "folder_path": unicodedata.normalize("NFD", r["folder_path"]),
+            "sha256": r["sha256"].upper(),
+        }
+        for r in snap_a
+    ]
+
+    # 1) 반사성: 동일 스냅샷(및 NFD/대문자 해시 동치 변형본) 비교 시 변경 없음
+    assert diff_snapshots(snap_a, snap_a).is_empty is True
+    assert diff_snapshots(snap_a, snap_a_nfd).is_empty is True
+
+    # 2) 대칭성: diff(A, B)와 diff(B, A)의 added/removed 및 변경 전후 값(old/new) 역전
+    ab = diff_snapshots(snap_a, snap_b)
+    ba = diff_snapshots(snap_b, snap_a)
+    assert [r["id"] for r in ab.added] == [r["id"] for r in ba.removed]
+    assert [r["id"] for r in ab.removed] == [r["id"] for r in ba.added]
+    assert {(c.id, c.old, c.new) for c in ab.renamed} == {(c.id, c.new, c.old) for c in ba.renamed}
+    assert {(c.id, c.old, c.new) for c in ab.moved} == {(c.id, c.new, c.old) for c in ba.moved}
+    assert {(c.id, c.old, c.new) for c in ab.content_changed} == {
+        (c.id, c.new, c.old) for c in ba.content_changed
+    }
+
+    # 3) 상호 배타성 및 기수 보존 법칙
+    added_ids = {r["id"] for r in ab.added}
+    removed_ids = {r["id"] for r in ab.removed}
+    mutated_ids = {c.id for c in (*ab.renamed, *ab.moved, *ab.content_changed)}
+    assert added_ids.isdisjoint(removed_ids)
+    assert mutated_ids.isdisjoint(added_ids | removed_ids)
+    assert len(snap_a) + len(added_ids) - len(removed_ids) == len(snap_b)
+
+
+class SnapshotTimelineStateMachine(RuleBasedStateMachine):
+    """[Pass 7 & 8] 다일차 스냅샷 기록(record_run)·최신 로드·원자적 쓰기 장애 주입(Fault Injection) 상태 머신."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshots_dir = Path(tempfile.mkdtemp())
+        self.current_time = datetime(2026, 10, 1, 9, 0, tzinfo=KST)
+        self.latest_records: list[dict] | None = None
+
+    def teardown(self) -> None:
+        shutil.rmtree(self.snapshots_dir, ignore_errors=True)
+
+    @rule(
+        raw_map=_SNAPSHOT_DICT_STRATEGY,
+        advance_days=st.integers(min_value=0, max_value=3),
+        advance_hours=st.integers(min_value=1, max_value=6),
+    )
+    def rule_record_snapshot_run(
+        self,
+        raw_map: dict[str, tuple[str, str, str, int]],
+        advance_days: int,
+        advance_hours: int,
+    ) -> None:
+        self.current_time += timedelta(days=advance_days, hours=advance_hours)
+        new_records = _build_snapshot_from_map(raw_map)
+        expected_first = self.latest_records is None
+        expected_changes = (
+            Changes() if self.latest_records is None else diff_snapshots(self.latest_records, new_records)
+        )
+        run = record_run(new_records, self.snapshots_dir, self.current_time)
+        assert run.first_run is expected_first
+        assert run.changes == expected_changes
+        assert run.total == len(new_records)
+        self.latest_records = sorted((dict(r) for r in new_records), key=lambda r: str(r.get("id", "")))
+
+    @rule(raw_map=_SNAPSHOT_DICT_STRATEGY)
+    def rule_injected_io_fault_preserves_prior_snapshot(
+        self,
+        raw_map: dict[str, tuple[str, str, str, int]],
+    ) -> None:
+        new_records = _build_snapshot_from_map(raw_map)
+        with (
+            patch.object(Path, "replace", side_effect=OSError("simulated disk full")),
+            pytest.raises(OSError, match="simulated disk full"),
+        ):
+            save_snapshot(new_records, self.snapshots_dir, self.current_time)
+
+    @invariant()
+    def invariant_latest_snapshot_matches_shadow_and_clean_tmp(self) -> None:
+        assert not list(self.snapshots_dir.glob(".*.tmp"))
+        loaded = load_latest_snapshot(self.snapshots_dir)
+        if self.latest_records is None:
+            assert loaded is None
+        else:
+            assert loaded == (snapshot_date(self.current_time), self.latest_records)
+
+
+def test_stateful_snapshot_timeline_and_fault_injection() -> None:
+    """다일차 스냅샷 상태 전이와 디스크 쓰기 장애 주입 시의 이전 스냅샷 보존 불변식을 검증한다."""
+    run_state_machine_as_test(
+        SnapshotTimelineStateMachine,
+        settings=settings(max_examples=25, stateful_step_count=12, deadline=None),
+    )
 
 
 if __name__ == "__main__":

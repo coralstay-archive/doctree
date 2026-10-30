@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from doctree.runtime_env.boundary_errors import SnapshotStorageError
+from doctree.runtime_env.boundary_errors import DoctreeBoundaryError, SnapshotStorageError
 from doctree.runtime_env.workspace_settings import PathLike, atomic_write_text, normalize_nfc
 
 __all__ = [
@@ -24,6 +24,7 @@ __all__ = [
     "change_summary",
     "diff_snapshots",
     "load_latest_snapshot",
+    "load_snapshot_records",
     "record_run",
     "save_snapshot",
     "snapshot_date",
@@ -32,11 +33,13 @@ __all__ = [
 Record = Mapping[str, Any]
 
 KST = timezone(timedelta(hours=9))
-_SNAPSHOT_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2})\.json$")
+_SNAPSHOT_NAME = re.compile(r"^([0-9]{4}-[0-9]{2}-[0-9]{2})\.json\Z")
 
 
 def snapshot_date(now: datetime) -> date:
     """시간대(tzinfo)가 있는 시각은 항상 한국 표준시(KST, UTC+9) 날짜로 변환한다."""
+    if not isinstance(now, datetime):
+        raise TypeError("now는 datetime 인스턴스여야 합니다.")
     if now.tzinfo is not None:
         return now.astimezone(KST).date()
     return now.date()
@@ -55,35 +58,53 @@ def save_snapshot(records: Iterable[Record], snapshots_dir: PathLike, now: datet
     return atomic_write_text(path, text)
 
 
+def load_snapshot_records(
+    path: PathLike,
+    *,
+    error_cls: type[DoctreeBoundaryError] = SnapshotStorageError,
+    wrap_io_errors: bool = False,
+) -> list[dict[str, Any]]:
+    """단일 스냅샷 JSON 파일을 읽고 records 배열 및 count 정합성을 검증해 반환한다."""
+    target = Path(path)
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        if wrap_io_errors:
+            raise error_cls(f"{target}: 스냅샷 파일을 읽을 수 없습니다: {exc}") from exc
+        raise
+    if not isinstance(data, dict) or not isinstance(data.get("records"), list):
+        raise error_cls(f"{target}: 스냅샷에 유효한 records 배열이 없습니다.")
+    records = list(data["records"])
+    if not all(isinstance(record, dict) for record in records):
+        raise error_cls(f"{target}: 스냅샷 records 항목은 모두 객체여야 합니다.")
+    if "count" in data and (type(data["count"]) is not int or data["count"] != len(records)):
+        raise error_cls(f"{target}: 스냅샷 count와 records 개수가 일치하지 않습니다.")
+    return records
+
+
 def load_latest_snapshot(snapshots_dir: PathLike) -> tuple[date, list[dict]] | None:
     """snapshots_dir에서 날짜가 가장 최근인 스냅샷의 (날짜, records)를 돌려준다.
 
     없으면 None. 'YYYY-MM-DD.json' 형식(유효한 날짜)이 아닌 파일은 무시한다.
     오늘 날짜 파일도 후보이므로, 이번 실행분을 저장하기 전에 호출해야 한다(B4).
     """
-    d = Path(snapshots_dir)
-    if not d.is_dir():
+    snapshots_path = Path(snapshots_dir)
+    if not snapshots_path.is_dir():
         return None
-    candidates = []
-    for p in d.iterdir():
-        m = _SNAPSHOT_NAME.match(p.name)
-        if not m or not p.is_file():
+    candidates: list[tuple[date, Path]] = []
+    for candidate_file in snapshots_path.iterdir():
+        match = _SNAPSHOT_NAME.match(candidate_file.name)
+        if not match or not candidate_file.is_file():
             continue
         try:
-            day = date.fromisoformat(m.group(1))
+            day = date.fromisoformat(match.group(1))
         except ValueError:
             continue
-        candidates.append((day, p))
+        candidates.append((day, candidate_file))
     if not candidates:
         return None
     day, path = max(candidates)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise SnapshotStorageError(f"{path}: 스냅샷 파일을 읽을 수 없습니다: {exc}") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("records"), list):
-        raise SnapshotStorageError(f"{path}: 스냅샷에 유효한 records 배열이 없습니다.")
-    return day, list(data.get("records", []))
+    return day, load_snapshot_records(path, error_cls=SnapshotStorageError, wrap_io_errors=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +117,7 @@ class Change:
     new: str
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Changes:
     """직전 스냅샷 대비 변경 묶음.
 
@@ -115,47 +136,82 @@ class Changes:
         return not (self.added or self.removed or self.renamed or self.moved or self.content_changed)
 
 
-def _record_sort_key(r: Record):
-    return (normalize_nfc(r.get("folder_path")), normalize_nfc(r.get("name")), str(r.get("id", "")))
+def _record_sort_key(record: Record) -> tuple[str, str, str]:
+    return (
+        normalize_nfc(record.get("folder_path")),
+        normalize_nfc(record.get("name")),
+        str(record.get("id", "")),
+    )
 
 
-def _change_sort_key(c: Change):
-    return (c.name, c.id)
+def _change_sort_key(change: Change) -> tuple[str, str]:
+    return (change.name, change.id)
 
 
-def _content_change(old: Record, new: Record) -> tuple[str, str] | None:
+def _content_change(old_record: Record, new_record: Record) -> tuple[str, str] | None:
     """내용 변경이면 (old, new) 표시값을, 아니면 None.
 
-    SHA-256이 양쪽 다 있으면 SHA-256으로, 한쪽이라도 비어 있으면 크기(size_bytes)로 판단한다.
+    SHA-256이 양쪽 다 있으면 SHA-256으로(공백 제거·소문자 정규화 기준), 한쪽이라도 비어 있으면 크기(size_bytes)로 판단한다.
     """
-    oh, nh = old.get("sha256") or "", new.get("sha256") or ""
-    if oh and nh:
-        return (oh, nh) if oh != nh else None
-    os_, ns = old.get("size_bytes"), new.get("size_bytes")
-    return (str(os_), str(ns)) if os_ != ns else None
+    old_sha256 = str(old_record.get("sha256") or "").strip().lower()
+    new_sha256 = str(new_record.get("sha256") or "").strip().lower()
+    if old_sha256 and new_sha256:
+        return (old_sha256, new_sha256) if old_sha256 != new_sha256 else None
+    old_size = old_record.get("size_bytes")
+    new_size = new_record.get("size_bytes")
+    return (str(old_size), str(new_size)) if old_size != new_size else None
+
+
+def _index_records_by_id(records: Iterable[Record]) -> dict[str, dict[str, Any]]:
+    """스냅샷 레코드 목록에서 ID 유효성 및 중복 여부를 검증하고 {file_id: dict} 사전을 반환한다."""
+    indexed: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise SnapshotStorageError("스냅샷 레코드는 매핑 객체여야 합니다.")
+        raw_id = record.get("id")
+        file_id = normalize_nfc(raw_id).strip() if isinstance(raw_id, str) else ""
+        if not file_id:
+            raise SnapshotStorageError("스냅샷 레코드에 유효한 id가 없습니다.")
+        if file_id in indexed:
+            raise SnapshotStorageError(f"스냅샷 내 중복 파일 ID가 존재합니다: {file_id!r}")
+        indexed[file_id] = {**dict(record), "id": file_id}
+    return indexed
 
 
 def diff_snapshots(old_records: Iterable[Record], new_records: Iterable[Record]) -> Changes:
     """두 레코드 목록을 파일 id 기준으로 비교한다 (한글 파일명·폴더 경로는 NFC 정규화 기준으로 대조)."""
-    old = {r["id"]: dict(r) for r in old_records}
-    new = {r["id"]: dict(r) for r in new_records}
-    ch = Changes()
-    ch.added = sorted((new[i] for i in new.keys() - old.keys()), key=_record_sort_key)
-    ch.removed = sorted((old[i] for i in old.keys() - new.keys()), key=_record_sort_key)
-    for i in new.keys() & old.keys():
-        o, n = old[i], new[i]
-        old_name, name = normalize_nfc(o.get("name")), normalize_nfc(n.get("name"))
-        old_folder, new_folder = normalize_nfc(o.get("folder_path")), normalize_nfc(n.get("folder_path"))
-        if old_name != name:
-            ch.renamed.append(Change(i, name, old_name, name))
+    old_by_id = _index_records_by_id(old_records)
+    new_by_id = _index_records_by_id(new_records)
+
+    added = sorted((new_by_id[file_id] for file_id in new_by_id.keys() - old_by_id.keys()), key=_record_sort_key)
+    removed = sorted((old_by_id[file_id] for file_id in old_by_id.keys() - new_by_id.keys()), key=_record_sort_key)
+    renamed: list[Change] = []
+    moved: list[Change] = []
+    content_changed: list[Change] = []
+
+    for file_id in new_by_id.keys() & old_by_id.keys():
+        old_record = old_by_id[file_id]
+        new_record = new_by_id[file_id]
+        old_name = normalize_nfc(old_record.get("name"))
+        new_name = normalize_nfc(new_record.get("name"))
+        old_folder = normalize_nfc(old_record.get("folder_path"))
+        new_folder = normalize_nfc(new_record.get("folder_path"))
+
+        if old_name != new_name:
+            renamed.append(Change(file_id, new_name, old_name, new_name))
         if old_folder != new_folder:
-            ch.moved.append(Change(i, name, old_folder, new_folder))
-        cc = _content_change(o, n)
-        if cc:
-            ch.content_changed.append(Change(i, name, cc[0], cc[1]))
-    for lst in (ch.renamed, ch.moved, ch.content_changed):
-        lst.sort(key=_change_sort_key)
-    return ch
+            moved.append(Change(file_id, new_name, old_folder, new_folder))
+        content_diff = _content_change(old_record, new_record)
+        if content_diff is not None:
+            content_changed.append(Change(file_id, new_name, content_diff[0], content_diff[1]))
+
+    return Changes(
+        added=added,
+        removed=removed,
+        renamed=sorted(renamed, key=_change_sort_key),
+        moved=sorted(moved, key=_change_sort_key),
+        content_changed=sorted(content_changed, key=_change_sort_key),
+    )
 
 
 @dataclass(frozen=True, slots=True)

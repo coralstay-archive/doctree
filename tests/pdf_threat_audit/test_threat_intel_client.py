@@ -3,15 +3,22 @@ import hashlib
 import io
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 from urllib import error as urllib_error
 
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 
 from doctree.doctree_cli import command_dispatcher as cli
 from doctree.pdf_threat_audit.threat_intel_client import (
+    ThreatIntelProvider,
     VerdictStatus,
+    VirusTotalClient,
     VtVerdict,
+    _extract_analysis_stats,
+    _parse_cached_verdict,
     audit_drive_records,
     check_hashes_with_vt,
     load_vt_cache,
@@ -80,6 +87,9 @@ def test_query_virustotal_hash_parses_clean_suspicious_malicious_and_errors():
         "{broken json",
         "[1, 2, 3]",
         '{"sha1": {"malicious": "not_an_int"}}',
+        '{"sha1": {"status": "unknown_verdict_xyz", "malicious": 0}}',
+        '{"sha1": {"status": "clean", "malicious": -1}}',
+        '{"sha1": {"status": "clean", "malicious": true}}',
     ],
 )
 def test_load_vt_cache_handles_corrupt_or_malformed_files_safely(tmp_path, corrupt_content):
@@ -107,6 +117,18 @@ def test_load_vt_cache_skips_non_dict_entries_and_error_verdicts_are_not_persist
     res_no_key = check_hashes_with_vt(["cached-clean", "uncached-sha", ""], api_key=None, cache_path=cache_file)
     assert list(res_no_key.keys()) == ["cached-clean"]
 
+    # ThreatIntelProvider 프로토콜 런타임 준수 및 커스텀 provider 주입 검증
+    vt_client = VirusTotalClient(api_key="fake-key")
+    assert isinstance(vt_client, ThreatIntelProvider)
+
+    class _StubProvider:
+        def query_hash(self, sha256: str) -> VtVerdict:
+            return VtVerdict(sha256=sha256, status=VerdictStatus.CLEAN, harmless=99)
+
+    assert isinstance(_StubProvider(), ThreatIntelProvider)
+    res_provider = check_hashes_with_vt(["stub-sha"], api_key=None, cache_path=cache_file, provider=_StubProvider())
+    assert res_provider["stub-sha"].harmless == 99
+
     # ERROR 상태인 캐시는 재조회 대상이 되며, 새로 조회한 결과가 ERROR면 캐시 파일을 덮어쓰지 않는다
     with patch("doctree.pdf_threat_audit.threat_intel_client.query_virustotal_hash") as mock_query:
         mock_query.return_value = VtVerdict(sha256="cached-err", status=VerdictStatus.ERROR, detail="still failing")
@@ -121,6 +143,15 @@ def test_load_vt_cache_skips_non_dict_entries_and_error_verdicts_are_not_persist
     assert res_new["brand-new"].malicious == 7
     reloaded = load_vt_cache(cache_file)
     assert reloaded["brand-new"].malicious == 7
+
+    # 디스크 쓰기 장애(OSError) 시 기존 VT 캐시 파일이 100% 보존되고 임시 파일이 남지 않는다
+    with (
+        patch.object(Path, "replace", side_effect=OSError("simulated vt disk full")),
+        pytest.raises(OSError, match="simulated vt disk full"),
+    ):
+        save_vt_cache(cache_file, {"corrupt": VtVerdict(sha256="corrupt", status=VerdictStatus.CLEAN)})
+    assert load_vt_cache(cache_file) == reloaded
+    assert not list(tmp_path.glob(".*.tmp"))
 
 
 def test_audit_drive_records_flags_malicious_and_suspicious(tmp_path):
@@ -143,32 +174,41 @@ def test_audit_drive_records_flags_malicious_and_suspicious(tmp_path):
     assert [r["id"] for r, _ in flagged] == ["2", "3"]
 
 
-@pytest.mark.integration
-def test_integration_real_loopback_http_server_with_vt_and_disk_cache(tmp_path):
-    """[Integration] http_cassettes.yaml 명세를 로드하여 실제 로컬 루프백 TCP HTTP 서버(127.0.0.1)에서 VT 프로토콜 통신 및 디스크 캐시 연동을 검증한다."""
+def _resolve_vt_stub_response(
+    sha: str,
+    vt_spec: dict,
+    clean_sha: str,
+    mal_sha: str,
+    transient_err_sha: str,
+    fail_transient_once: dict[str, bool],
+) -> tuple[int, dict | None]:
+    if sha == transient_err_sha and fail_transient_once["should_fail"]:
+        fail_transient_once["should_fail"] = False
+        return vt_spec["responses"]["rate_limited"]["status"], None
+    if sha in (clean_sha, transient_err_sha):
+        resp = vt_spec["responses"]["clean"]
+        return resp["status"], resp["body"]
+    if sha == mal_sha:
+        resp = vt_spec["responses"]["malicious"]
+        return resp["status"], resp["body"]
+    return vt_spec["responses"]["not_found"]["status"], None
+
+
+def _start_vt_stub_server(
+    vt_spec: dict,
+    clean_sha: str,
+    mal_sha: str,
+    transient_err_sha: str,
+):
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    import yaml
-
-    from doctree.pdf_threat_audit.threat_intel_client import audit_local_pdfs
-
-    cassette_path = Path(__file__).with_name("http_cassettes.yaml")
-    cassettes = yaml.safe_load(cassette_path.read_text(encoding="utf-8"))["endpoints"]
-    vt_spec = cassettes["virustotal_v3"]
-
-    clean_pdf = tmp_path / "clean_doc.pdf"
-    mal_pdf = tmp_path / "malicious_doc.pdf"
-    clean_sha = _make_pdf(clean_pdf, body=b"1 0 obj << /Type /Page >> endobj")
-    mal_sha = _make_pdf(mal_pdf, body=b"1 0 obj << /OpenAction << /S /Launch >> >> endobj")
-    transient_err_sha = "9" * 64
-
-    request_log = []
+    request_log: list[tuple[str, dict]] = []
     fail_transient_once = {"should_fail": True}
 
     class ThreatIntelStubHandler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
-            pass  # 테스트 출력 오염 방지
+            pass
 
         def _send_json(self, status: int, body: dict | None = None):
             self.send_response(status)
@@ -184,21 +224,36 @@ def test_integration_real_loopback_http_server_with_vt_and_disk_cache(tmp_path):
             if self.headers.get(req_hdr["name"]) != req_hdr["value"]:
                 return self._send_json(vt_spec["unauthorized_status"])
             sha = self.path.rsplit("/", 1)[-1]
-            if sha == transient_err_sha and fail_transient_once["should_fail"]:
-                fail_transient_once["should_fail"] = False
-                return self._send_json(vt_spec["responses"]["rate_limited"]["status"])
-            if sha in (clean_sha, transient_err_sha):
-                resp = vt_spec["responses"]["clean"]
-            elif sha == mal_sha:
-                resp = vt_spec["responses"]["malicious"]
-            else:
-                return self._send_json(vt_spec["responses"]["not_found"]["status"])
-            return self._send_json(resp["status"], resp["body"])
+            status, body = _resolve_vt_stub_response(
+                sha, vt_spec, clean_sha, mal_sha, transient_err_sha, fail_transient_once
+            )
+            return self._send_json(status, body)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), ThreatIntelStubHandler)
-    port = server.server_port
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    return server, request_log
+
+
+@pytest.mark.integration
+def test_integration_real_loopback_http_server_with_vt_and_disk_cache(tmp_path):
+    """[Integration] http_cassettes.yaml 명세를 로드하여 실제 로컬 루프백 TCP HTTP 서버(127.0.0.1)에서 VT 프로토콜 통신 및 디스크 캐시 연동을 검증한다."""
+    import yaml
+
+    from doctree.pdf_threat_audit.threat_intel_client import audit_local_pdfs
+
+    cassette_path = Path(__file__).with_name("http_cassettes.yaml")
+    cassettes = yaml.safe_load(cassette_path.read_text(encoding="utf-8"))["endpoints"]
+    vt_spec = cassettes["virustotal_v3"]
+
+    clean_pdf = tmp_path / "clean_doc.pdf"
+    mal_pdf = tmp_path / "malicious_doc.pdf"
+    clean_sha = _make_pdf(clean_pdf, body=b"1 0 obj << /Type /Page >> endobj")
+    mal_sha = _make_pdf(mal_pdf, body=b"1 0 obj << /OpenAction << /S /Launch >> >> endobj")
+    transient_err_sha = "9" * 64
+
+    server, request_log = _start_vt_stub_server(vt_spec, clean_sha, mal_sha, transient_err_sha)
+    port = server.server_port
 
     cache_file = tmp_path / ".vt_cache.json"
     try:
@@ -276,3 +331,38 @@ def test_audit_cli_checks_drive_snapshot_and_local_pdfs(tmp_path, capsys):
     out_bad = capsys.readouterr().out
     assert "/JavaScript" in out_bad
     assert js_sha[:16] in out_bad
+
+
+_STAT_VAL_STRATEGY = st.one_of(st.none(), st.booleans(), st.integers(min_value=-10, max_value=100), st.text(max_size=8))
+
+
+@settings(max_examples=80, deadline=None)
+@given(
+    sha=st.one_of(st.none(), st.text(max_size=20)),
+    status=st.one_of(st.sampled_from([s.value for s in VerdictStatus]), st.text(max_size=10)),
+    mal=_STAT_VAL_STRATEGY,
+    susp=_STAT_VAL_STRATEGY,
+    detail=st.one_of(st.none(), st.booleans(), st.integers(min_value=-5, max_value=5), st.text(max_size=20)),
+)
+@example(sha="  ABC123  ", status="clean", mal=0, susp=0, detail=None)
+@example(sha="  ABC123  ", status="clean", mal=0, susp=0, detail=0)
+@example(sha="sha-bool", status="clean", mal=True, susp=0, detail="x")
+def test_property_fuzz_parse_cached_verdict_and_extract_analysis_stats(
+    sha: Any,
+    status: str,
+    mal: Any,
+    susp: Any,
+    detail: Any,
+) -> None:
+    """_parse_cached_verdict와 _extract_analysis_stats가 불리언·음수·None detail을 방어하고 음이 아닌 정수만 수용한다."""
+    raw_item = {"status": status, "malicious": mal, "suspicious": susp, "detail": detail}
+    verdict = _parse_cached_verdict(sha, raw_item)
+    if verdict is not None:
+        assert verdict.sha256 == sha.strip().lower()
+        assert type(verdict.malicious) is int and verdict.malicious >= 0
+        assert type(verdict.suspicious) is int and verdict.suspicious >= 0
+        assert verdict.detail == ("" if detail is None else str(detail))
+
+    stats = _extract_analysis_stats({"data": {"attributes": {"last_analysis_stats": raw_item}}})
+    assert all(type(v) is int and v >= 0 for v in stats.values())
+

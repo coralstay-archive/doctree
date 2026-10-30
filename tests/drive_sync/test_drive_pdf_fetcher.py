@@ -3,12 +3,21 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 
-from doctree.drive_sync.drive_pdf_fetcher import SCOPES, DriveListError, GoogleDriveManager
+from doctree.drive_sync.drive_pdf_fetcher import (
+    SCOPES,
+    DriveListError,
+    GoogleDriveManager,
+    _safe_non_negative_int,
+    is_pdf_item,
+)
 
 
 class TestGoogleDriveManager(unittest.TestCase):
@@ -172,11 +181,14 @@ class TestGoogleDriveManager(unittest.TestCase):
                 self.assertIsNone(d_no_cred.service_account_file)
                 self.assertEqual(d_no_cred.token_file, Path("token.json"))
 
-                # 2) 현재 디렉터리에 credentials.json이 존재할 때 자동 감지 (알 수 없는 형식이면 service=None)
+                # 2) 현재 디렉터리에 credentials.json이 존재할 때 자동 감지 (알 수 없는 형식 또는 비객체 JSON이면 service=None)
                 Path("credentials.json").write_text(json.dumps({"unknown_key": 123}), encoding="utf-8")
                 d_unknown = GoogleDriveManager(service_account_file=None)
                 self.assertEqual(d_unknown.service_account_file, "credentials.json")
                 self.assertIsNone(d_unknown.service)
+
+                Path("credentials.json").write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+                self.assertIsNone(GoogleDriveManager(service_account_file="credentials.json").service)
 
                 # 3) credentials.json이 잘못된 JSON일 때 외부 except 블록 처리
                 Path("credentials.json").write_text("{corrupt json", encoding="utf-8")
@@ -230,17 +242,18 @@ class TestGoogleDriveManager(unittest.TestCase):
         drive.service = None
         self.assertIsNone(drive.get_account_and_quota())
 
-        # 무제한 스토리지 계정 (storageQuota에 limit 키 없음)
+        # 무제한 스토리지 계정 (storageQuota에 limit 키 없음, 비정상 숫자/bool 방어 포함)
         mock_service = MagicMock()
         mock_service.about.return_value.get.return_value.execute.return_value = {
             "user": {"displayName": "Org User", "emailAddress": "org@example.com"},
-            "storageQuota": {"usage": str(10 * 1024**3), "usageInDrive": str(8 * 1024**3)},
+            "storageQuota": {"limit": True, "usage": str(10 * 1024**3), "usageInDrive": "not-an-int"},
         }
         drive.service = mock_service
         info = drive.get_account_and_quota()
         self.assertIsNone(info["limit_gb"])
         self.assertEqual(info["usage_percent"], 0.0)
         self.assertEqual(info["usage_gb"], 10.0)
+        self.assertEqual(info["drive_usage_gb"], 0.0)
 
         # API 호출 예외 발생 시 None 반환
         mock_service.about.return_value.get.return_value.execute.side_effect = RuntimeError("network down")
@@ -496,6 +509,36 @@ def test_integration_drive_api_cassettes_about_and_paginated_files():
     for actual, exp in zip(records, expected_records, strict=True):
         for k, v in exp.items():
             assert actual[k] == v
+
+
+@settings(max_examples=80, deadline=None)
+@given(
+    raw_val=st.one_of(
+        st.none(),
+        st.booleans(),
+        st.integers(min_value=-100_000, max_value=100_000),
+        st.floats(allow_nan=True, allow_infinity=True),
+        st.text(max_size=20),
+    ),
+    raw_name=st.one_of(st.none(), st.integers(), st.text(max_size=30)),
+    raw_mime=st.one_of(st.none(), st.text(max_size=30)),
+)
+@example(raw_val=float("inf"), raw_name=123, raw_mime=None)
+@example(raw_val=float("-inf"), raw_name="\u1100\u1161.PDF", raw_mime="application/octet-stream")
+@example(raw_val=True, raw_name=None, raw_mime="application/pdf")
+def test_property_fuzz_safe_non_negative_int_and_is_pdf_item(
+    raw_val: Any,
+    raw_name: Any,
+    raw_mime: Any,
+) -> None:
+    """_safe_non_negative_int의 무한대/불리언/음수 방어 및 is_pdf_item의 비문자열/유니코드 안전성을 검증한다."""
+    parsed = _safe_non_negative_int(raw_val)
+    assert type(parsed) is int
+    assert parsed >= 0
+    assert _safe_non_negative_int(parsed) == parsed
+
+    verdict = is_pdf_item({"name": raw_name, "mimeType": raw_mime})
+    assert isinstance(verdict, bool)
 
 
 if __name__ == "__main__":

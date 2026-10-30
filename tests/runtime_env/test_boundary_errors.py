@@ -13,6 +13,8 @@ from urllib import error as urllib_error
 
 import pytest
 import yaml
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 from rich.console import Console
 
 from doctree.content_taxonomy.category_classifier import classify_records, load_catalog
@@ -33,12 +35,14 @@ from doctree.drive_sync.snapshot_diff_tracker import (
 from doctree.pdf_threat_audit.threat_intel_client import audit_local_pdfs
 from doctree.runtime_env.boundary_errors import (
     AUTH_MISSING_MESSAGE,
+    BOUNDARY_TO_EXTERNAL,
     SNAPSHOT_PRESERVED_NOTICE,
     BoundaryKind,
     ClassificationError,
     DoctreeBoundaryError,
     DriveAuthError,
     DriveListError,
+    ExternalBoundary,
     SecurityAuditError,
     coerce_boundary_error,
     execute_json_http_get,
@@ -63,14 +67,24 @@ class _FakeHttpResp(io.BytesIO):
 
 def test_unified_boundary_error_hierarchy_and_consistent_formatting():
     """모든 경계 예외가 DoctreeBoundaryError와 표준 파이썬 예외(ValueError/RuntimeError/OSError)를 다중 상속하고 일관된 한국어 메시지를 만든다."""
+    assert set(ExternalBoundary) == {
+        ExternalBoundary.PROCESS_TERMINAL,
+        ExternalBoundary.NETWORK_API,
+        ExternalBoundary.FILESYSTEM,
+        ExternalBoundary.SYSTEM_CLOCK,
+    }
+    assert set(BOUNDARY_TO_EXTERNAL.keys()) == set(BoundaryKind)
+
     auth_err = DriveAuthError()
     assert isinstance(auth_err, (DoctreeBoundaryError, RuntimeError))
     assert auth_err.boundary == BoundaryKind.AUTH
+    assert auth_err.external_boundary == ExternalBoundary.NETWORK_API
     assert auth_err.format_error() == AUTH_MISSING_MESSAGE
 
     drive_err = DriveListError("네트워크 타임아웃", preserve_snapshot=True)
     assert isinstance(drive_err, (DoctreeBoundaryError, RuntimeError))
     assert drive_err.boundary == BoundaryKind.DRIVE_API
+    assert drive_err.external_boundary == ExternalBoundary.NETWORK_API
     assert drive_err.preserve_snapshot is True
     assert drive_err.format_error() == "드라이브 목록 조회 실패: 네트워크 타임아웃"
     # 이미 접두어가 붙어 있는 경우 중복 접두어를 붙이지 않는다 (멱등성)
@@ -80,19 +94,23 @@ def test_unified_boundary_error_hierarchy_and_consistent_formatting():
     cls_err = ClassificationError("미분류 콘텐츠 1권: 'b1'")
     assert isinstance(cls_err, (DoctreeBoundaryError, ValueError))
     assert cls_err.boundary == BoundaryKind.TAXONOMY
+    assert cls_err.external_boundary == ExternalBoundary.FILESYSTEM
     assert cls_err.format_error() == "분류 검증 실패: 미분류 콘텐츠 1권: 'b1'"
 
     fs_err = SnapshotStorageError("권한 거부")
     assert isinstance(fs_err, (DoctreeBoundaryError, OSError))
     assert fs_err.boundary == BoundaryKind.FILESYSTEM
+    assert fs_err.external_boundary == ExternalBoundary.FILESYSTEM
     assert fs_err.format_error() == "파일 입출력 실패: 권한 거부"
 
     sec_err = SecurityAuditError("VirusTotal 위협 감지 1건: bad.pdf", preserve_snapshot=True)
     assert isinstance(sec_err, (DoctreeBoundaryError, RuntimeError))
     assert sec_err.boundary == BoundaryKind.SECURITY_AUDIT
+    assert sec_err.external_boundary == ExternalBoundary.FILESYSTEM
     assert sec_err.format_error() == "VirusTotal 위협 감지 1건: bad.pdf"
 
     ti_err = DoctreeBoundaryError("HTTP 429 쿼터 초과", boundary=BoundaryKind.THREAT_INTEL_API)
+    assert ti_err.external_boundary == ExternalBoundary.NETWORK_API
     assert ti_err.format_error() == "위협 인텔리전스 API 요청 실패: HTTP 429 쿼터 초과"
 
 
@@ -180,6 +198,15 @@ def test_execute_json_http_get_unified_web_boundary_handler():
         None,
         "connection refused",
     )
+
+    # 6) 비-HTTP/HTTPS URL 스킴(file:// 등) 차단
+    body_scheme, code_scheme, detail_scheme = execute_json_http_get(
+        "file:///etc/passwd",
+        {},
+        service_name="TestAPI",
+    )
+    assert (body_scheme, code_scheme) == (None, None)
+    assert "지원하지 않는 URL 스킴입니다" in detail_scheme
 
 
 def test_cli_commands_handle_corrupt_snapshot_and_audit_boundary_errors_cleanly(tmp_path):
@@ -320,10 +347,10 @@ def test_boundary_8_live_repository_data_contract_configs_and_snapshots():
     assert sum(len(c.subcategories) for c in catalog.categories) == 55
     assert len(catalog.assignments) >= 232
 
-    # 2) project_layout_profiles.yaml 스키마 검증 (handcrafted, research, toolchain 프로파일 정의)
+    # 2) project_layout_profiles.yaml 스키마 검증 (handcrafted, toolchain 프로파일 정의)
     layout_data = yaml.safe_load(layout_yaml.read_text(encoding="utf-8"))
     assert layout_data["schema_version"] == 1
-    assert set(layout_data["profiles"].keys()) == {"handcrafted", "research", "toolchain"}
+    assert set(layout_data["profiles"].keys()) == {"handcrafted", "toolchain"}
     for profile_name, profile in layout_data["profiles"].items():
         assert profile["content_dir"] == "contents", profile_name
         assert "/contents/" in profile["gitignore_entries"], profile_name
@@ -423,3 +450,46 @@ def test_process_terminal_signal_boundaries_and_packaging_hygiene():
     agents_md = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     assert "src.classification" not in agents_md
     assert "doctree.content_taxonomy.category_classifier.load_catalog" in agents_md
+
+
+@settings(max_examples=80, deadline=None)
+@given(
+    err_cls=st.sampled_from(
+        [
+            DriveAuthError,
+            DriveListError,
+            ClassificationError,
+            SnapshotStorageError,
+            SecurityAuditError,
+        ]
+    ),
+    msg=st.text(max_size=60),
+    preserve=st.booleans(),
+)
+@example(err_cls=DriveAuthError, msg="", preserve=False)
+@example(err_cls=DriveListError, msg="드라이브 목록 조회 실패: 이미 접두어 있음", preserve=True)
+def test_property_fuzz_boundary_error_formatting_and_http_get_coercion(
+    err_cls: type[DoctreeBoundaryError],
+    msg: str,
+    preserve: bool,
+) -> None:
+    """DoctreeBoundaryError.format_error의 접두어 멱등성, coerce_boundary_error 보존성, execute_json_http_get의 예외 포획 불변식을 검증한다."""
+    err = err_cls(msg, preserve_snapshot=preserve)
+    formatted = err.format_error()
+    assert err_cls(formatted, preserve_snapshot=preserve).format_error() == formatted
+    assert coerce_boundary_error(err, preserve_snapshot=preserve) is err
+    coerced = coerce_boundary_error(
+        ValueError(msg),
+        default_boundary=err.boundary,
+        preserve_snapshot=preserve,
+    )
+    assert isinstance(coerced, DoctreeBoundaryError)
+    assert coerced.boundary == err.boundary
+    assert coerced.preserve_snapshot is preserve
+
+    body, code, detail = execute_json_http_get(
+        "https://example.com",
+        headers={},
+        urlopen=MagicMock(side_effect=ValueError(msg)),
+    )
+    assert body is None and code is None and isinstance(detail, str)

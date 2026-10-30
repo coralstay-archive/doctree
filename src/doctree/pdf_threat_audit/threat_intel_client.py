@@ -1,4 +1,4 @@
-"""VirusTotal API v3 해시 평판 조회 클라이언트 및 로컬 캐시."""
+"""위협 인텔리전스 해시 평판 조회 클라이언트(ThreatIntelProvider Protocol · VirusTotal v3) 및 로컬 캐시."""
 from __future__ import annotations
 
 import json
@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Any, Protocol, runtime_checkable
 from urllib import request as urllib_request
 
 from doctree.pdf_threat_audit.pdf_byte_inspector import (
@@ -19,7 +20,9 @@ from doctree.runtime_env.workspace_settings import PathLike, atomic_write_text, 
 
 __all__ = [
     "VT_API_URL",
+    "ThreatIntelProvider",
     "VerdictStatus",
+    "VirusTotalClient",
     "VtVerdict",
     "audit_drive_records",
     "audit_local_pdfs",
@@ -55,29 +58,73 @@ class VtVerdict:
     detail: str = ""
 
 
+@runtime_checkable
+class ThreatIntelProvider(Protocol):
+    """해시 기반 위협 인텔리전스 조회 프로바이더 구조적 서브타이핑 인터페이스 (PEP 544)."""
+
+    __slots__ = ()
+
+    def query_hash(self, sha256: str) -> VtVerdict:
+        """64자리 SHA-256 해시에 대한 위협 평판(VtVerdict)을 반환한다."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class VirusTotalClient:
+    """VirusTotal API v3 기반 ThreatIntelProvider 구현체."""
+
+    api_key: str
+    timeout: float = 10.0
+
+    def query_hash(self, sha256: str) -> VtVerdict:
+        return query_virustotal_hash(sha256, self.api_key, timeout=self.timeout)
+
+
+_VALID_VERDICT_STATUSES: frozenset[str] = frozenset(item.value for item in VerdictStatus)
+_COUNT_FIELDS: tuple[str, ...] = ("malicious", "suspicious", "harmless", "undetected")
+
+
+def _parse_cached_verdict(sha: Any, item: Any) -> VtVerdict | None:
+    """캐시 JSON의 단일 항목이 유효한 VtVerdict 스키마를 충족할 때만 인스턴스를 반환한다."""
+    if not isinstance(sha, str) or not sha.strip() or not isinstance(item, dict):
+        return None
+    norm_sha = sha.strip().lower()
+    status = str(item.get("status", VerdictStatus.CLEAN))
+    if status not in _VALID_VERDICT_STATUSES:
+        return None
+    counts: dict[str, int] = {}
+    for field_name in _COUNT_FIELDS:
+        raw_val = item.get(field_name, 0)
+        if type(raw_val) is not int or raw_val < 0:
+            return None
+        counts[field_name] = raw_val
+    raw_detail = item.get("detail")
+    return VtVerdict(
+        sha256=norm_sha,
+        status=status,
+        malicious=counts["malicious"],
+        suspicious=counts["suspicious"],
+        harmless=counts["harmless"],
+        undetected=counts["undetected"],
+        detail="" if raw_detail is None else str(raw_detail),
+    )
+
+
 def load_vt_cache(cache_path: PathLike) -> dict[str, VtVerdict]:
     p = Path(cache_path)
     if not p.is_file():
         return {}
     try:
         raw = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return {}
-        out: dict[str, VtVerdict] = {}
-        for sha, item in raw.items():
-            if isinstance(item, dict):
-                out[sha] = VtVerdict(
-                    sha256=sha,
-                    status=str(item.get("status", VerdictStatus.CLEAN)),
-                    malicious=int(item.get("malicious", 0)),
-                    suspicious=int(item.get("suspicious", 0)),
-                    harmless=int(item.get("harmless", 0)),
-                    undetected=int(item.get("undetected", 0)),
-                    detail=str(item.get("detail", "")),
-                )
-        return out
-    except (OSError, ValueError, TypeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, VtVerdict] = {}
+    for sha, item in raw.items():
+        if (verdict := _parse_cached_verdict(sha, item)) is not None:
+            out[verdict.sha256] = verdict
+    return out
 
 
 def save_vt_cache(cache_path: PathLike, cache: dict[str, VtVerdict]) -> None:
@@ -95,10 +142,23 @@ def save_vt_cache(cache_path: PathLike, cache: dict[str, VtVerdict]) -> None:
     atomic_write_text(cache_path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
 
+def _extract_analysis_stats(body: dict[str, Any]) -> dict[str, int]:
+    """VirusTotal 응답 JSON에서 중첩된 last_analysis_stats 사전을 방어적으로 추출한다."""
+    data_obj = body.get("data")
+    attrs_obj = data_obj.get("attributes") if isinstance(data_obj, dict) else None
+    stats_obj = attrs_obj.get("last_analysis_stats") if isinstance(attrs_obj, dict) else None
+    raw_stats = stats_obj if isinstance(stats_obj, dict) else {}
+    return {
+        field_name: raw_val if (type(raw_val := raw_stats.get(field_name, 0)) is int and raw_val >= 0) else 0
+        for field_name in _COUNT_FIELDS
+    }
+
+
 def query_virustotal_hash(sha256: str, api_key: str, timeout: float = 10.0) -> VtVerdict:
     """VirusTotal API v3에서 SHA-256 해시 평판을 조회한다 (파일 업로드 없음)."""
+    norm_sha = sha256.strip().lower()
     body, code, detail = execute_json_http_get(
-        VT_API_URL.format(sha256=sha256),
+        VT_API_URL.format(sha256=norm_sha),
         headers={"x-apikey": api_key, "Accept": "application/json"},
         timeout=timeout,
         service_name="VirusTotal",
@@ -106,17 +166,13 @@ def query_virustotal_hash(sha256: str, api_key: str, timeout: float = 10.0) -> V
     )
     if body is None:
         status = VerdictStatus.NOT_FOUND if code == 404 else VerdictStatus.ERROR
-        return VtVerdict(sha256=sha256, status=status, detail=detail)
+        return VtVerdict(sha256=norm_sha, status=status, detail=detail)
 
-    stats = (
-        body.get("data", {})
-        .get("attributes", {})
-        .get("last_analysis_stats", {})
-    )
-    malicious = int(stats.get("malicious", 0))
-    suspicious = int(stats.get("suspicious", 0))
-    harmless = int(stats.get("harmless", 0))
-    undetected = int(stats.get("undetected", 0))
+    stats = _extract_analysis_stats(body)
+    malicious = stats["malicious"]
+    suspicious = stats["suspicious"]
+    harmless = stats["harmless"]
+    undetected = stats["undetected"]
 
     if malicious > 0:
         status = VerdictStatus.MALICIOUS
@@ -126,7 +182,7 @@ def query_virustotal_hash(sha256: str, api_key: str, timeout: float = 10.0) -> V
         status = VerdictStatus.CLEAN
 
     return VtVerdict(
-        sha256=sha256,
+        sha256=norm_sha,
         status=status,
         malicious=malicious,
         suspicious=suspicious,
@@ -139,19 +195,25 @@ def check_hashes_with_vt(
     sha256_list: Iterable[str],
     api_key: str | None,
     cache_path: PathLike | None = None,
+    *,
+    provider: ThreatIntelProvider | None = None,
 ) -> dict[str, VtVerdict]:
-    """SHA-256 목록을 캐시 우선으로 조회하고, 미캐시 항목만 VirusTotal로 확인한다."""
+    """SHA-256 목록을 캐시 우선으로 조회하고, 미캐시 항목만 위협 인텔리전스 프로바이더로 확인한다."""
     cache = load_vt_cache(cache_path) if cache_path else {}
+    active_provider = provider if provider is not None else (VirusTotalClient(api_key) if api_key else None)
     results: dict[str, VtVerdict] = {}
     dirty = False
 
-    for sha in dict.fromkeys(s for s in sha256_list if s):
+    normalized_hashes = dict.fromkeys(
+        norm_sha for s in sha256_list if isinstance(s, str) and (norm_sha := s.strip().lower())
+    )
+    for sha in normalized_hashes:
         if sha in cache and cache[sha].status != VerdictStatus.ERROR:
             results[sha] = cache[sha]
             continue
-        if not api_key:
+        if active_provider is None:
             continue
-        verdict = query_virustotal_hash(sha, api_key)
+        verdict = active_provider.query_hash(sha)
         results[sha] = verdict
         if verdict.status != VerdictStatus.ERROR:
             cache[sha] = verdict
@@ -170,13 +232,13 @@ def audit_drive_records(
     """드라이브 스냅샷 레코드들의 SHA-256 해시를 VirusTotal(또는 로컬 캐시)로 점검한다."""
     recs = list(records)
     verdicts = check_hashes_with_vt(
-        (r.get("sha256") or "" for r in recs),
+        (str(r.get("sha256") or "") for r in recs),
         api_key=api_key,
         cache_path=cache_path,
     )
     flagged: list[tuple[dict, VtVerdict]] = []
     for rec in recs:
-        sha = rec.get("sha256") or ""
+        sha = str(rec.get("sha256") or "").strip().lower()
         v = verdicts.get(sha)
         if v and v.status in (VerdictStatus.MALICIOUS, VerdictStatus.SUSPICIOUS):
             flagged.append((rec, v))

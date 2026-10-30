@@ -7,18 +7,24 @@ import re
 import struct
 import subprocess
 import zlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Final
 
-from doctree.pdf_threat_audit.pdf_byte_inspector import compute_sha256, inspect_pdf_bytes
+from doctree.pdf_threat_audit.pdf_byte_inspector import inspect_pdf_bytes
 from doctree.runtime_env.boundary_errors import ClassificationError
 from doctree.runtime_env.workspace_settings import (
+    DEFAULT_TOC_CHAPTER,
     PathLike,
     atomic_write_bytes,
     atomic_write_text,
+    build_default_toc_entry,
+    compute_sha256,
     normalize_nfc,
+    render_dot_to_svg,
+    sanitize_dot_label,
 )
 
 __all__ = [
@@ -36,13 +42,21 @@ __all__ = [
     "verify_single_page",
 ]
 
-_PAGE_OBJ_RE = re.compile(rb"/Type\s*/Page(?![A-Za-z])")
-_STREAM_RE = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.S)
-_PAREN_STR_RE = re.compile(rb"\((?:\\.|[^\\()])*\)")
-_FIGURE_TAG_RE = re.compile(rb"(?:/Subtype\s*/Image|/Figure\b|%%FIGURE:([^\r\n]+))")
-_TOKEN_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?|[A-Za-z_][A-Za-z0-9_]*|[가-힣]+")
-_NUM_OR_IDENT_RE = re.compile(r"^(?:[0-9]+(?:\.[0-9]+)?|[A-Za-z_][A-Za-z0-9_]*)$")
-_CODE_BLOCK_RE = re.compile(r"```([A-Za-z0-9_+.\-]*)\n(.*?)```", re.S)
+_PAGE_OBJ_RE: Final[re.Pattern[bytes]] = re.compile(rb"/Type\s*/Page(?![A-Za-z])")
+_STREAM_RE: Final[re.Pattern[bytes]] = re.compile(rb"stream\r?\n(.*?)\r?\nendstream", re.DOTALL)
+_PAREN_STR_RE: Final[re.Pattern[bytes]] = re.compile(rb"\((?:\\.|[^\\()])*\)")
+_FIGURE_TAG_RE: Final[re.Pattern[bytes]] = re.compile(rb"(?:/Subtype\s*/Image|/Figure\b|%%FIGURE:([^\r\n]+))")
+_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"[0-9]+(?:\.[0-9]+)?|[A-Za-z_][A-Za-z0-9_]*|[가-힣]+")
+_NUM_OR_IDENT_RE: Final[re.Pattern[str]] = re.compile(r"^(?:[0-9]+(?:\.[0-9]+)?|[A-Za-z_][A-Za-z0-9_]*)\Z")
+_CODE_BLOCK_RE: Final[re.Pattern[str]] = re.compile(r"```([A-Za-z0-9_+.\-]*)\n(.*?)```", re.DOTALL)
+_DOT_GRAPH_KEYWORD_RE: Final[re.Pattern[str]] = re.compile(r"\b(?:di)?graph\b")
+_MAX_DECOMPRESSED_STREAM_BYTES: Final[int] = 16 * 1024 * 1024
+_CODE_PREFIX_LANG: Final[tuple[tuple[str, str], ...]] = (
+    ("CODE_PY:", "python"),
+    ("CODE_CPP:", "cpp"),
+    ("CODE_JAVA:", "java"),
+    ("CODE_SQL:", "sql"),
+)
 
 
 def _make_minimal_png_bytes(width: int = 16, height: int = 16) -> bytes:
@@ -66,12 +80,16 @@ class RawPdfPage:
 
     page_number: int
     raw_text: str
-    figures_detected: int
     figure_labels: tuple[str, ...]
     chapter_title: str = ""
     section_title: str = ""
     code_lang: str = ""
     code_snippet: str = ""
+
+    @property
+    def figures_detected(self) -> int:
+        """페이지 내에서 감지된 도식/그림 개수 (figure_labels 단일 진실 원천에서 파생)."""
+        return len(self.figure_labels)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,8 +105,20 @@ class PageVerificationRecord:
     code_syntax_ok: bool
     dot_render_ok: bool
     parallel_layout_ok: bool
-    missing_tokens: tuple[str, ...]
-    status: str
+    missing_tokens: tuple[str, ...] = ()
+
+    @property
+    def status(self) -> str:
+        """5대 동일성 검증 통과 여부('PASS' 또는 'WARN' — 검증 지표 단일 진실 원천에서 파생)."""
+        passed = (
+            self.token_recall >= 0.99
+            and self.numbers_matched
+            and self.figures_detected == self.figures_extracted
+            and self.code_syntax_ok
+            and self.dot_render_ok
+            and self.parallel_layout_ok
+        )
+        return "PASS" if passed else "WARN"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,35 +141,147 @@ class ContentParseResult:
     content_name: str
     output_dir: Path
     index_json_path: Path
-    total_pages: int
     verified_pages: int
-    passed_pages: int
-    warned_pages: int
     pages: tuple[PageVerificationRecord, ...]
+
+    @property
+    def total_pages(self) -> int:
+        """전체 페이지 수 (pages 튜플 단일 진실 원천에서 파생)."""
+        return len(self.pages)
+
+    @property
+    def passed_pages(self) -> int:
+        """5대 동일성 검증을 통과(PASS)한 페이지 수."""
+        return sum(1 for page_record in self.pages if page_record.status == "PASS")
+
+    @property
+    def warned_pages(self) -> int:
+        """5대 동일성 검증에서 경고(WARN)가 발생한 페이지 수."""
+        return len(self.pages) - self.passed_pages
+
+
+_PDF_ESCAPE_RE = re.compile(rb"\\([nrt()\\]|[0-7]{1,3})")
+_PDF_ESCAPE_MAP: Mapping[bytes, bytes] = MappingProxyType({
+    b"n": b"\n",
+    b"r": b"\r",
+    b"t": b"\t",
+    b"(": b"(",
+    b")": b")",
+    b"\\": b"\\",
+})
+
+
+def _replace_pdf_escape(match: re.Match[bytes]) -> bytes:
+    token = match.group(1)
+    if (mapped := _PDF_ESCAPE_MAP.get(token)) is not None:
+        return mapped
+    return bytes([int(token, 8) & 0xFF])
 
 
 def _decode_pdf_literal(raw_bytes: bytes) -> str:
-    inner = raw_bytes[1:-1]
-    inner = (
-        inner.replace(b"\\n", b"\n")
-        .replace(b"\\r", b"\r")
-        .replace(b"\\t", b"\t")
-        .replace(b"\\(", b"(")
-        .replace(b"\\)", b")")
-        .replace(b"\\\\", b"\\")
-    )
+    """PDF 리터럴 문자열((...))의 이스케이프 시퀀스(8진수 포함)를 단일 패스로 디코딩하고 NFC로 정규화한다."""
+    inner = _PDF_ESCAPE_RE.sub(_replace_pdf_escape, raw_bytes[1:-1]).replace(b"\x00", b"")
     return normalize_nfc(inner.decode("utf-8", errors="replace"))
 
 
 def _extract_stream_payload(stream_bytes: bytes) -> bytes:
+    """FlateDecode(zlib) 스트림을 최대 16MiB 상한 내에서 안전하게 압축 해제한다 (압축 폭탄 방어)."""
     try:
-        return zlib.decompress(stream_bytes)
+        return zlib.decompressobj().decompress(stream_bytes, _MAX_DECOMPRESSED_STREAM_BYTES)
     except zlib.error:
         return stream_bytes
 
 
+def _split_pdf_into_page_chunks(raw: bytes) -> list[bytes]:
+    matches = list(_PAGE_OBJ_RE.finditer(raw))
+    if not matches:
+        return [raw]
+    return [
+        raw[m.start() : (matches[idx + 1].start() if idx + 1 < len(matches) else len(raw))]
+        for idx, m in enumerate(matches)
+    ]
+
+
+def _extract_lines_and_figures_from_chunk(
+    page_num: int,
+    chunk: bytes,
+) -> tuple[list[str], list[str]]:
+    decoded_parts: list[str] = []
+    fig_labels: list[str] = []
+    streams = _STREAM_RE.findall(chunk)
+    scan_targets = [_extract_stream_payload(s) for s in streams] if streams else [chunk]
+
+    for target_bytes in scan_targets:
+        decoded_parts.extend(
+            text_piece
+            for lit in _PAREN_STR_RE.findall(target_bytes)
+            if (text_piece := _decode_pdf_literal(lit).strip())
+        )
+        for fig_m in _FIGURE_TAG_RE.finditer(target_bytes):
+            raw_lbl = fig_m.group(1)
+            clean_lbl = (
+                normalize_nfc(raw_lbl.replace(b"\x00", b"").decode("utf-8", errors="replace")).strip()
+                if raw_lbl
+                else ""
+            )
+            fig_labels.append(clean_lbl or f"Page {page_num} Figure {len(fig_labels) + 1}")
+    return "\n".join(decoded_parts).splitlines(), fig_labels
+
+
+def _read_ocr_cache_text(src_pdf: Path, content_name: str, page_num: int) -> str:
+    """페이지별 OCR 캐시(.ocr-cache/**/page_NNNN.txt)가 존재하면 NFC 정규화된 텍스트를 반환한다."""
+    page_file = f"page_{page_num:04d}.txt"
+    contents_root = _find_contents_ancestor(src_pdf) or src_pdf.parent
+    candidates = (
+        src_pdf.parent / ".ocr-cache" / page_file,
+        src_pdf.parent / ".ocr-cache" / content_name / page_file,
+        contents_root / ".ocr-cache" / content_name / page_file,
+    )
+    for cand in candidates:
+        if cand.is_file():
+            return normalize_nfc(cand.read_text(encoding="utf-8", errors="replace")).replace("\x00", "")
+    return ""
+
+
+def _parse_single_page_chunk(page_num: int, chunk: bytes, ocr_text: str = "") -> RawPdfPage:
+    lines, fig_labels = _extract_lines_and_figures_from_chunk(page_num, chunk)
+    if ocr_text:
+        lines.extend(
+            cleaned
+            for raw_line in normalize_nfc(ocr_text).replace("\x00", "").splitlines()
+            if (cleaned := raw_line.strip())
+        )
+    chapter_title = ""
+    section_title = ""
+    code_lang = ""
+    code_snippet = ""
+
+    for line in lines:
+        if line.startswith("CHAPTER:"):
+            chapter_title = line[len("CHAPTER:") :].strip()
+            continue
+        if line.startswith("SECTION:"):
+            section_title = line[len("SECTION:") :].strip()
+            continue
+        for prefix, lang in _CODE_PREFIX_LANG:
+            if line.startswith(prefix):
+                code_lang = lang
+                code_snippet = line[len(prefix) :].strip()
+                break
+
+    return RawPdfPage(
+        page_number=page_num,
+        raw_text="\n".join(lines),
+        figure_labels=tuple(fig_labels),
+        chapter_title=chapter_title,
+        section_title=section_title,
+        code_lang=code_lang,
+        code_snippet=code_snippet,
+    )
+
+
 def extract_raw_pdf_pages(pdf_path: PathLike) -> tuple[str, list[RawPdfPage]]:
-    """원본 PDF에서 SHA-256 해시와 페이지별 텍스트·도식 영역·구조 메타데이터를 추출한다."""
+    """원본 PDF에서 SHA-256 해시와 페이지별 텍스트·도식 영역·구조 메타데이터(.ocr-cache 포함)를 추출한다."""
     p = Path(pdf_path)
     if not p.is_file():
         raise ClassificationError(f"파싱할 PDF 파일이 존재하지 않습니다: {p}")
@@ -148,129 +290,67 @@ def extract_raw_pdf_pages(pdf_path: PathLike) -> tuple[str, list[RawPdfPage]]:
     if not valid_header or not valid_eof:
         raise ClassificationError(f"유효하지 않거나 손상된 PDF 파일입니다 (%PDF- 헤더 또는 %%EOF 누락): {p}")
 
-    sha256 = compute_sha256(p)
-    raw = p.read_bytes()
-
-    page_chunks: list[bytes] = []
-    matches = list(_PAGE_OBJ_RE.finditer(raw))
-    if matches:
-        for idx, m in enumerate(matches):
-            start = m.start()
-            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
-            page_chunks.append(raw[start:end])
-    else:
-        page_chunks.append(raw)
-
-    pages: list[RawPdfPage] = []
-    for page_num, chunk in enumerate(page_chunks, start=1):
-        decoded_parts: list[str] = []
-        fig_labels: list[str] = []
-
-        streams = _STREAM_RE.findall(chunk)
-        scan_targets = [_extract_stream_payload(s) for s in streams] if streams else [chunk]
-
-        for target_bytes in scan_targets:
-            for lit in _PAREN_STR_RE.findall(target_bytes):
-                text_piece = _decode_pdf_literal(lit).strip()
-                if text_piece:
-                    decoded_parts.append(text_piece)
-            for fig_m in _FIGURE_TAG_RE.finditer(target_bytes):
-                custom_lbl = fig_m.group(1)
-                if custom_lbl:
-                    fig_labels.append(normalize_nfc(custom_lbl.decode("utf-8", errors="replace")).strip())
-                else:
-                    fig_labels.append(f"Page {page_num} Figure {len(fig_labels) + 1}")
-
-        full_text = "\n".join(decoded_parts)
-        chapter_title = ""
-        section_title = ""
-        code_lang = ""
-        code_snippet = ""
-        clean_lines: list[str] = []
-
-        for line in full_text.splitlines():
-            if line.startswith("CHAPTER:"):
-                chapter_title = line[len("CHAPTER:"):].strip()
-                clean_lines.append(line)
-            elif line.startswith("SECTION:"):
-                section_title = line[len("SECTION:"):].strip()
-                clean_lines.append(line)
-            elif line.startswith("CODE_PY:"):
-                code_lang = "python"
-                code_snippet = line[len("CODE_PY:"):].strip()
-                clean_lines.append(line)
-            elif line.startswith("CODE_CPP:"):
-                code_lang = "cpp"
-                code_snippet = line[len("CODE_CPP:"):].strip()
-                clean_lines.append(line)
-            elif line.startswith("CODE_SQL:"):
-                code_lang = "sql"
-                code_snippet = line[len("CODE_SQL:"):].strip()
-                clean_lines.append(line)
-            else:
-                clean_lines.append(line)
-
-        pages.append(
-            RawPdfPage(
-                page_number=page_num,
-                raw_text="\n".join(clean_lines),
-                figures_detected=len(fig_labels),
-                figure_labels=tuple(fig_labels),
-                chapter_title=chapter_title,
-                section_title=section_title,
-                code_lang=code_lang,
-                code_snippet=code_snippet,
-            )
-        )
-
+    resolved_pdf = p.resolve()
+    sha256 = compute_sha256(resolved_pdf)
+    content_name, _ = _resolve_pdf_identity(resolved_pdf)
+    page_chunks = _split_pdf_into_page_chunks(resolved_pdf.read_bytes())
+    pages = [
+        _parse_single_page_chunk(num, chunk, _read_ocr_cache_text(resolved_pdf, content_name, num))
+        for num, chunk in enumerate(page_chunks, start=1)
+    ]
     return sha256, pages
 
 
 def build_dot_diagram(content_name: str, page_number: int, fig_index: int, label: str) -> str:
     """추출된 그림/도식 메타데이터를 표준 Graphviz DOT 코드로 변환한다."""
-    safe_label = label.replace('"', "'")
+    safe_label = sanitize_dot_label(label)
+    safe_content_name = sanitize_dot_label(content_name)
     graph_id = f"Page{page_number}_Fig{fig_index}"
     return (
         f"digraph {graph_id} {{\n"
         f'    rankdir=LR;\n'
         f'    node [shape=record, fontname="Menlo", fontsize=11];\n'
-        f'    source [label="{{{content_name} | {safe_label}}}"];\n'
+        f'    source [label="{{{safe_content_name} | {safe_label}}}"];\n'
         f'    model [label="{{Page {page_number} | Diagram {fig_index}}}"];\n'
         f"    source -> model;\n"
         f"}}"
     )
 
 
-def render_dot_to_svg(dot_source: str, svg_path: Path, *, dot_bin: str = "dot") -> bool:
-    """Graphviz(dot -Tsvg)로 DOT 코드를 렌더링하여 벡터 SVG 파일로 저장한다."""
+def tokenize_content(text: str) -> list[str]:
+    """원본 PDF 텍스트와 마크다운 본문에서 단어·숫자·식별자 토큰을 추출한다."""
+    return _TOKEN_RE.findall(normalize_nfc(text))
+
+
+def _validate_dot_block(code: str, *, dot_bin: str) -> bool:
+    if not _DOT_GRAPH_KEYWORD_RE.search(code) or code.count("{") != code.count("}") or "{" not in code:
+        return False
     try:
         proc = subprocess.run(
             [dot_bin, "-Tsvg"],
-            input=dot_source,
+            input=code,
             text=True,
             capture_output=True,
             timeout=10,
             check=False,
         )
-        if proc.returncode == 0 and "<svg" in proc.stdout:
-            atomic_write_text(svg_path, proc.stdout)
-            return True
+        return proc.returncode == 0
     except (OSError, subprocess.SubprocessError):
-        pass
+        return True
 
-    fallback_svg = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n'
-        '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="80">\n'
-        '  <text x="10" y="40" font-family="Menlo" font-size="11">DOT Fallback SVG</text>\n'
-        "</svg>\n"
-    )
-    atomic_write_text(svg_path, fallback_svg)
+
+def _validate_code_block(lang: str, code: str) -> bool:
+    if lang in ("python", "py"):
+        try:
+            ast.parse(code)
+            return True
+        except (SyntaxError, ValueError, RecursionError):
+            return False
+    if lang in ("cpp", "c++", "c", "java"):
+        return code.count("{") == code.count("}") and code.count("(") == code.count(")")
+    if lang == "sql":
+        return code.count("'") % 2 == 0 and code.count("(") == code.count(")")
     return True
-
-
-def tokenize_content(text: str) -> list[str]:
-    """원본 PDF 텍스트와 마크다운 본문에서 단어·숫자·식별자 토큰을 추출한다."""
-    return _TOKEN_RE.findall(normalize_nfc(text))
 
 
 def verify_code_and_dot_blocks(md_text: str, *, dot_bin: str = "dot") -> tuple[bool, bool]:
@@ -284,35 +364,54 @@ def verify_code_and_dot_blocks(md_text: str, *, dot_bin: str = "dot") -> tuple[b
         if not code:
             continue
         if lang in ("dot", "graphviz"):
-            if not re.search(r"\b(?:di)?graph\b", code) or code.count("{") != code.count("}") or "{" not in code:
+            if not _validate_dot_block(code, dot_bin=dot_bin):
                 dot_ok = False
-                continue
-            try:
-                proc = subprocess.run(
-                    [dot_bin, "-Tsvg"],
-                    input=code,
-                    text=True,
-                    capture_output=True,
-                    timeout=10,
-                    check=False,
-                )
-                if proc.returncode != 0:
-                    dot_ok = False
-            except OSError:
-                pass
-        elif lang in ("python", "py"):
-            try:
-                ast.parse(code)
-            except SyntaxError:
-                code_ok = False
-        elif lang in ("cpp", "c++", "c"):
-            if code.count("{") != code.count("}") or code.count("(") != code.count(")"):
-                code_ok = False
-        elif lang == "sql":
-            if code.count("'") % 2 != 0 or code.count("(") != code.count(")"):
-                code_ok = False
+        elif not _validate_code_block(lang, code):
+            code_ok = False
 
     return code_ok, dot_ok
+
+
+def _evaluate_token_fidelity(raw_text: str, md_text: str) -> tuple[float, bool, tuple[str, ...]]:
+    """원본 PDF 텍스트와 마크다운 본문 간 토큰 재현율·수치/식별자 일치 여부·누락 토큰 목록을 계산한다."""
+    pdf_tokens = set(tokenize_content(raw_text))
+    if not pdf_tokens:
+        return 1.0, True, ()
+
+    md_tokens = set(tokenize_content(md_text))
+    matched_tokens = pdf_tokens & md_tokens
+    token_recall = round(len(matched_tokens) / len(pdf_tokens), 4)
+    missing_tokens = tuple(sorted(pdf_tokens - md_tokens))
+    pdf_num_idents = {token for token in pdf_tokens if _NUM_OR_IDENT_RE.match(token)}
+    numbers_matched = pdf_num_idents.issubset(md_tokens)
+    return token_recall, numbers_matched, missing_tokens
+
+
+def _verify_figure_assets(
+    content_name: str,
+    page_num: int,
+    figures_detected: int,
+    md_text: str,
+    assets_dir: Path,
+) -> tuple[int, bool]:
+    """추출된 PNG/SVG 도식 파일 존재 여부 및 마크다운 내 병렬 배치 링크 무결성을 검증한다."""
+    figures_extracted = 0
+    parallel_layout_ok = True
+    for fig_idx in range(1, figures_detected + 1):
+        fig_rel = f"assets/{content_name}-{page_num}page-fig{fig_idx}.png"
+        diag_rel = f"assets/{content_name}-{page_num}page-diag{fig_idx}.svg"
+        fig_file = assets_dir / f"{content_name}-{page_num}page-fig{fig_idx}.png"
+        diag_file = assets_dir / f"{content_name}-{page_num}page-diag{fig_idx}.svg"
+
+        if fig_file.is_file() and fig_file.stat().st_size > 0:
+            figures_extracted += 1
+        if (
+            f"![원본 그림]({fig_rel})" not in md_text
+            or f"![DOT 다이어그램]({diag_rel})" not in md_text
+            or not diag_file.is_file()
+        ):
+            parallel_layout_ok = False
+    return figures_extracted, parallel_layout_ok
 
 
 def verify_single_page(
@@ -339,52 +438,15 @@ def verify_single_page(
             dot_render_ok=False,
             parallel_layout_ok=False,
             missing_tokens=tuple(sorted(set(tokenize_content(raw_page.raw_text)))),
-            status="WARN",
         )
 
     md_text = md_path.read_text(encoding="utf-8")
-    pdf_tokens = set(tokenize_content(raw_page.raw_text))
-    md_tokens = set(tokenize_content(md_text))
-
-    if not pdf_tokens:
-        token_recall = 1.0
-        missing_tokens: tuple[str, ...] = ()
-        numbers_matched = True
-    else:
-        matched_tokens = pdf_tokens & md_tokens
-        token_recall = round(len(matched_tokens) / len(pdf_tokens), 4)
-        missing = sorted(pdf_tokens - md_tokens)
-        missing_tokens = tuple(missing)
-        pdf_num_idents = {t for t in pdf_tokens if _NUM_OR_IDENT_RE.match(t)}
-        numbers_matched = pdf_num_idents.issubset(md_tokens)
-
-    figures_extracted = 0
-    parallel_layout_ok = True
-    for fig_idx in range(1, raw_page.figures_detected + 1):
-        fig_rel = f"assets/{content_name}-{page_num}page-fig{fig_idx}.png"
-        diag_rel = f"assets/{content_name}-{page_num}page-diag{fig_idx}.svg"
-        fig_file = assets_dir / f"{content_name}-{page_num}page-fig{fig_idx}.png"
-        diag_file = assets_dir / f"{content_name}-{page_num}page-diag{fig_idx}.svg"
-
-        if fig_file.is_file() and fig_file.stat().st_size > 0:
-            figures_extracted += 1
-        if (
-            f"![원본 그림]({fig_rel})" not in md_text
-            or f"![DOT 다이어그램]({diag_rel})" not in md_text
-            or not diag_file.is_file()
-        ):
-            parallel_layout_ok = False
-
+    token_recall, numbers_matched, missing_tokens = _evaluate_token_fidelity(raw_page.raw_text, md_text)
+    figures_extracted, parallel_layout_ok = _verify_figure_assets(
+        content_name, page_num, raw_page.figures_detected, md_text, assets_dir
+    )
     code_syntax_ok, dot_render_ok = verify_code_and_dot_blocks(md_text, dot_bin=dot_bin)
 
-    passed = (
-        token_recall >= 0.99
-        and numbers_matched
-        and raw_page.figures_detected == figures_extracted
-        and code_syntax_ok
-        and dot_render_ok
-        and parallel_layout_ok
-    )
     return PageVerificationRecord(
         page=page_num,
         md_file=md_filename,
@@ -396,8 +458,88 @@ def verify_single_page(
         dot_render_ok=dot_render_ok,
         parallel_layout_ok=parallel_layout_ok,
         missing_tokens=missing_tokens,
-        status="PASS" if passed else "WARN",
     )
+
+
+def _find_contents_ancestor(src_pdf: Path) -> Path | None:
+    """src_pdf의 상위 디렉터리 중 가장 가까운 'contents' 디렉터리를 반환한다."""
+    return next((parent for parent in src_pdf.parents if parent.name == "contents"), None)
+
+
+def _resolve_pdf_identity(src_pdf: Path) -> tuple[str, str]:
+    """원본 PDF 경로로부터 (content_name, contents/ 하위 상대 경로)를 결정한다."""
+    contents_dir = _find_contents_ancestor(src_pdf)
+    if contents_dir is not None:
+        rel_dir = src_pdf.parent.relative_to(contents_dir)
+        rel_pdf_posix = normalize_nfc(src_pdf.relative_to(contents_dir).as_posix())
+        if rel_dir.parts:
+            return normalize_nfc(src_pdf.parent.name), rel_pdf_posix
+        return normalize_nfc(src_pdf.stem), rel_pdf_posix
+    return normalize_nfc(src_pdf.stem), normalize_nfc(src_pdf.name)
+
+
+def _resolve_content_output_dir(src_pdf: Path, content_name: str, output_dir: PathLike | None) -> Path:
+    if output_dir is not None:
+        return Path(output_dir).resolve()
+    contents_dir = _find_contents_ancestor(src_pdf)
+    if contents_dir is not None:
+        rel_dir = src_pdf.parent.relative_to(contents_dir)
+        if rel_dir.parts:
+            norm_rel = Path(*(normalize_nfc(part) for part in rel_dir.parts))
+            return contents_dir.parent / "content_data" / norm_rel
+        return contents_dir.parent / "content_data" / content_name
+    return src_pdf.parent / "content_data" / content_name
+
+
+def _render_page_markdown_and_assets(
+    content_name: str,
+    src_pdf_name: str,
+    rp: RawPdfPage,
+    content_out_dir: Path,
+    assets_dir: Path,
+    *,
+    dot_bin: str,
+) -> dict[str, Any]:
+    page_num = rp.page_number
+    toc_entry = build_default_toc_entry(
+        content_name,
+        page_num,
+        chapter_title=rp.chapter_title or DEFAULT_TOC_CHAPTER,
+        section_title=rp.section_title,
+    )
+    md_lines = [
+        f"# {toc_entry['chapter']}",
+        f"## {toc_entry['section']}",
+        f"<!-- source_pdf: contents/{src_pdf_name} | page: {page_num} -->",
+        "",
+        rp.raw_text.strip() or f"*(빈 간지 페이지 {page_num})*",
+    ]
+
+    if rp.code_snippet:
+        md_lines.extend(["", f"```{rp.code_lang}", rp.code_snippet, "```"])
+
+    for fig_idx, fig_label in enumerate(rp.figure_labels, start=1):
+        fig_name = f"{content_name}-{page_num}page-fig{fig_idx}.png"
+        diag_name = f"{content_name}-{page_num}page-diag{fig_idx}.svg"
+        atomic_write_bytes(assets_dir / fig_name, MINIMAL_PNG_BYTES)
+
+        dot_code = build_dot_diagram(content_name, page_num, fig_idx, fig_label)
+        render_dot_to_svg(dot_code, assets_dir / diag_name, dot_bin=dot_bin)
+
+        md_lines.extend(
+            [
+                "",
+                f"![원본 그림](assets/{fig_name})",
+                f"![DOT 다이어그램](assets/{diag_name})",
+                "",
+                "```dot",
+                dot_code,
+                "```",
+            ]
+        )
+
+    atomic_write_text(content_out_dir / toc_entry["md_file"], "\n".join(md_lines) + "\n")
+    return toc_entry
 
 
 def parse_pdf_to_content_data(
@@ -410,90 +552,22 @@ def parse_pdf_to_content_data(
     """단일 PDF 파일을 페이지별 마크다운·크롭 PNG·Graphviz DOT SVG로 파싱하고 index.json을 생성한다."""
     src_pdf = Path(pdf_path).resolve()
     sha256, raw_pages = extract_raw_pdf_pages(src_pdf)
-    content_name = normalize_nfc(src_pdf.stem)
-
-    if output_dir is not None:
-        content_out_dir = Path(output_dir).resolve()
-    elif src_pdf.parent.name == "contents":
-        content_out_dir = src_pdf.parent.parent / "content_data" / content_name
-    else:
-        content_out_dir = src_pdf.parent / "content_data" / content_name
-
+    content_name, rel_pdf_posix = _resolve_pdf_identity(src_pdf)
+    content_out_dir = _resolve_content_output_dir(src_pdf, content_name, output_dir)
     assets_dir = content_out_dir / "assets"
     content_out_dir.mkdir(parents=True, exist_ok=True)
     assets_dir.mkdir(parents=True, exist_ok=True)
 
-    toc: list[dict[str, Any]] = []
-    for rp in raw_pages:
-        page_num = rp.page_number
-        md_filename = f"{content_name}-{page_num}page.md"
-        md_path = content_out_dir / md_filename
-
-        ch_heading = rp.chapter_title or "01_기본_개념"
-        sec_heading = rp.section_title or f"{page_num:02d}_페이지_핵심"
-        toc.append(
-            {
-                "page": page_num,
-                "chapter": ch_heading,
-                "section": sec_heading,
-                "md_file": md_filename,
-            }
+    toc = [
+        _render_page_markdown_and_assets(
+            content_name, rel_pdf_posix, rp, content_out_dir, assets_dir, dot_bin=dot_bin
         )
-
-        md_lines = [
-            f"# {ch_heading}",
-            f"## {sec_heading}",
-            f"<!-- source_pdf: contents/{src_pdf.name} | page: {page_num} -->",
-            "",
-        ]
-        if rp.raw_text.strip():
-            md_lines.append(rp.raw_text.strip())
-        else:
-            md_lines.append(f"*(빈 간지 페이지 {page_num})*")
-
-        if rp.code_snippet:
-            md_lines.extend(
-                [
-                    "",
-                    f"```{rp.code_lang}",
-                    rp.code_snippet,
-                    "```",
-                ]
-            )
-
-        for fig_idx, fig_label in enumerate(rp.figure_labels, start=1):
-            fig_name = f"{content_name}-{page_num}page-fig{fig_idx}.png"
-            diag_name = f"{content_name}-{page_num}page-diag{fig_idx}.svg"
-            fig_path = assets_dir / fig_name
-            diag_path = assets_dir / diag_name
-
-            atomic_write_bytes(fig_path, MINIMAL_PNG_BYTES)
-
-            dot_code = build_dot_diagram(content_name, page_num, fig_idx, fig_label)
-            render_dot_to_svg(dot_code, diag_path, dot_bin=dot_bin)
-
-            md_lines.extend(
-                [
-                    "",
-                    f"![원본 그림](assets/{fig_name})",
-                    f"![DOT 다이어그램](assets/{diag_name})",
-                    "",
-                    "```dot",
-                    dot_code,
-                    "```",
-                ]
-            )
-
-        md_content = "\n".join(md_lines) + "\n"
-        atomic_write_text(md_path, md_content)
+        for rp in raw_pages
+    ]
 
     if verify:
         return verify_content_data(
-            src_pdf,
-            content_out_dir,
-            dot_bin=dot_bin,
-            preloaded_pages=(sha256, raw_pages),
-            toc=toc,
+            src_pdf, content_out_dir, dot_bin=dot_bin, preloaded_pages=(sha256, raw_pages), toc=toc
         )
 
     page_records = tuple(
@@ -507,14 +581,12 @@ def parse_pdf_to_content_data(
             code_syntax_ok=True,
             dot_render_ok=True,
             parallel_layout_ok=True,
-            missing_tokens=(),
-            status="PASS",
         )
         for rp in raw_pages
     )
     index_path = _write_index_json(
         content_out_dir,
-        source_pdf=f"contents/{normalize_nfc(src_pdf.name)}",
+        source_pdf=f"contents/{rel_pdf_posix}",
         source_sha256=sha256,
         total_pages=len(raw_pages),
         verified_pages=0,
@@ -525,10 +597,7 @@ def parse_pdf_to_content_data(
         content_name=content_name,
         output_dir=content_out_dir,
         index_json_path=index_path,
-        total_pages=len(raw_pages),
         verified_pages=0,
-        passed_pages=len(raw_pages),
-        warned_pages=0,
         pages=page_records,
     )
 
@@ -568,31 +637,38 @@ def verify_content_data(
     src_pdf = Path(pdf_path).resolve()
     out_dir = Path(content_out_dir).resolve()
     assets_dir = out_dir / "assets"
-    content_name = normalize_nfc(src_pdf.stem)
+    content_name, rel_pdf_posix = _resolve_pdf_identity(src_pdf)
 
     sha256, raw_pages = preloaded_pages if preloaded_pages is not None else extract_raw_pdf_pages(src_pdf)
 
-    records: list[PageVerificationRecord] = []
-    for rp in raw_pages:
-        md_path = out_dir / f"{content_name}-{rp.page_number}page.md"
-        rec = verify_single_page(content_name, rp, md_path, assets_dir, dot_bin=dot_bin)
-        records.append(rec)
-
-    resolved_toc = list(toc) if toc is not None else [
-        {
-            "page": rp.page_number,
-            "chapter": rp.chapter_title or "01_기본_개념",
-            "section": rp.section_title or f"{rp.page_number:02d}_페이지_핵심",
-            "md_file": f"{content_name}-{rp.page_number}page.md",
-        }
+    records = [
+        verify_single_page(
+            content_name,
+            rp,
+            out_dir / f"{content_name}-{rp.page_number}page.md",
+            assets_dir,
+            dot_bin=dot_bin,
+        )
         for rp in raw_pages
     ]
 
-    passed = sum(1 for r in records if r.status == "PASS")
-    warned = len(records) - passed
+    resolved_toc = (
+        list(toc)
+        if toc is not None
+        else [
+            build_default_toc_entry(
+                content_name,
+                rp.page_number,
+                chapter_title=rp.chapter_title,
+                section_title=rp.section_title,
+            )
+            for rp in raw_pages
+        ]
+    )
+
     index_path = _write_index_json(
         out_dir,
-        source_pdf=f"contents/{normalize_nfc(src_pdf.name)}",
+        source_pdf=f"contents/{rel_pdf_posix}",
         source_sha256=sha256,
         total_pages=len(raw_pages),
         verified_pages=len(records),
@@ -603,9 +679,6 @@ def verify_content_data(
         content_name=content_name,
         output_dir=out_dir,
         index_json_path=index_path,
-        total_pages=len(raw_pages),
         verified_pages=len(records),
-        passed_pages=passed,
-        warned_pages=warned,
         pages=tuple(records),
     )

@@ -1,14 +1,16 @@
 """로컬 PDF 정적 무결성 및 위험 태그(/JavaScript, /Launch 등) 바이트 검사기."""
 from __future__ import annotations
 
-import hashlib
 import re
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
-from doctree.runtime_env.workspace_settings import PathLike
+from doctree.runtime_env.workspace_settings import (
+    PathLike,
+    compute_sha256,
+    discover_local_pdfs,
+)
 
 __all__ = [
     "DANGEROUS_PDF_TAGS",
@@ -22,7 +24,7 @@ if TYPE_CHECKING:
     from doctree.pdf_threat_audit.threat_intel_client import VtVerdict
 
 # PDF 사전(Dictionary) 내부에서 자동 실행·스크립트·외부 명령 실행에 악용되는 위험 PDF 객체 패턴
-DANGEROUS_PDF_TAGS: tuple[tuple[re.Pattern, str], ...] = (
+DANGEROUS_PDF_TAGS: Final[tuple[tuple[re.Pattern[bytes], str], ...]] = (
     (re.compile(rb"/JavaScript(?![A-Za-z0-9_])"), "/JavaScript"),
     (re.compile(rb"/S\s*/JS(?![A-Za-z0-9_])"), "/JS"),
     (re.compile(rb"/Launch(?![A-Za-z0-9_])"), "/Launch"),
@@ -49,72 +51,49 @@ class LocalPdfAudit:
             return False
         if self.dangerous_tags:
             return False
-        return not (self.vt_verdict and self.vt_verdict.status in ("malicious", "suspicious"))
+        if self.vt_verdict is None:
+            return True
+        return (
+            self.vt_verdict.status not in ("malicious", "suspicious")
+            and self.vt_verdict.malicious <= 0
+            and self.vt_verdict.suspicious <= 0
+        )
 
 
-def compute_sha256(path: PathLike, chunk_size: int = 1024 * 1024) -> str:
-    """로컬 파일의 SHA-256 해시(64자리 소문자 hex)를 계산한다."""
-    h = hashlib.sha256()
-    with Path(path).open("rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+_MIN_PDF_BYTE_SIZE: Final[int] = 8
+_PDF_HEADER_SCAN_BYTES: Final[int] = 1024
+_PDF_TAIL_SCAN_BYTES: Final[int] = 65536
+_TAG_SCAN_CHUNK_BYTES: Final[int] = 1024 * 1024
+_TAG_BOUNDARY_OVERLAP_BYTES: Final[int] = 64
 
 
 def inspect_pdf_bytes(path: PathLike) -> tuple[bool, bool, tuple[str, ...]]:
     """로컬 PDF 바이트를 스캔해 (%PDF- 헤더 유무, %%EOF 유무, 위험 태그 목록)을 반환한다."""
-    p = Path(path)
-    size = p.stat().st_size
-    if size < 8:
+    pdf_path = Path(path)
+    if not pdf_path.is_file():
+        return False, False, ()
+    file_size = pdf_path.stat().st_size
+    if file_size < _MIN_PDF_BYTE_SIZE:
         return False, False, ()
 
-    with p.open("rb") as f:
-        head = f.read(1024)
-        valid_header = b"%PDF-" in head
+    with pdf_path.open("rb") as pdf_stream:
+        header_bytes = pdf_stream.read(_PDF_HEADER_SCAN_BYTES)
+        valid_header = b"%PDF-" in header_bytes
 
-        tail_len = min(size, 65536)
-        f.seek(size - tail_len)
-        tail = f.read(tail_len)
-        valid_eof = b"%%EOF" in tail
+        tail_length = min(file_size, _PDF_TAIL_SCAN_BYTES)
+        pdf_stream.seek(file_size - tail_length)
+        tail_bytes = pdf_stream.read(tail_length)
+        valid_eof = b"%%EOF" in tail_bytes
 
-        found_tags = set()
-        f.seek(0)
-        prev = b""
-        while True:
-            chunk = f.read(1024 * 1024)
-            if not chunk:
-                break
-            window = prev + chunk
+        found_tags: set[str] = set()
+        pdf_stream.seek(0)
+        boundary_overlap = b""
+        while chunk := pdf_stream.read(_TAG_SCAN_CHUNK_BYTES):
+            scan_window = boundary_overlap + chunk
             for pattern, label in DANGEROUS_PDF_TAGS:
-                if label not in found_tags and pattern.search(window):
+                if label not in found_tags and pattern.search(scan_window):
                     found_tags.add(label)
-            prev = chunk[-64:]
+            boundary_overlap = chunk[-_TAG_BOUNDARY_OVERLAP_BYTES:]
 
     ordered_tags = tuple(label for _, label in DANGEROUS_PDF_TAGS if label in found_tags)
     return valid_header, valid_eof, ordered_tags
-
-
-def discover_local_pdfs(roots: Iterable[PathLike]) -> list[Path]:
-    """지정된 루트(또는 워크스페이스 하위 contents/ 폴더)에서 모든 로컬 PDF를 찾는다."""
-    pdfs: list[Path] = []
-    seen = set()
-    for root in roots:
-        base = Path(root)
-        if not base.exists():
-            continue
-        if base.is_file() and base.suffix.lower() == ".pdf":
-            resolved = base.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                pdfs.append(base)
-            continue
-        for p in sorted(base.rglob("*")):
-            if p.is_file() and p.suffix.lower() == ".pdf":
-                resolved = p.resolve()
-                if resolved not in seen:
-                    seen.add(resolved)
-                    pdfs.append(p)
-    return pdfs

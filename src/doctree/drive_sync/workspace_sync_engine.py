@@ -7,9 +7,9 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
-from doctree.pdf_threat_audit.pdf_byte_inspector import compute_sha256, discover_local_pdfs
 from doctree.runtime_env.boundary_errors import (
     ClassificationError,
     DriveListError,
@@ -19,6 +19,9 @@ from doctree.runtime_env.workspace_settings import (
     PathLike,
     atomic_write_bytes,
     atomic_write_text,
+    compute_sha256,
+    discover_local_pdfs,
+    format_record_path,
     normalize_nfc,
 )
 
@@ -37,7 +40,7 @@ __all__ = [
 ]
 
 Record = Mapping[str, Any]
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +71,28 @@ class SyncComparisonResult:
     recomputed: int
 
 
+def _parse_local_cache_entry(key: Any, val: Any) -> tuple[str, dict[str, Any]] | None:
+    """로컬 해시 캐시의 단일 키-값 쌍이 유효하면 (NFC 정규화 키, 캐시 레코드)를 반환한다."""
+    if not isinstance(key, str) or not key.strip() or not isinstance(val, dict):
+        return None
+    sha = str(val.get("sha256", "")).lower()
+    size = val.get("size_bytes")
+    mtime_ns = val.get("mtime_ns")
+    if (
+        not _SHA256_RE.match(sha)
+        or type(size) is not int
+        or size < 0
+        or type(mtime_ns) is not int
+        or mtime_ns < 0
+    ):
+        return None
+    return normalize_nfc(key), {
+        "size_bytes": size,
+        "mtime_ns": mtime_ns,
+        "sha256": sha,
+    }
+
+
 def load_local_contents_cache(cache_path: PathLike | None) -> dict[str, dict]:
     """로컬 contents/ 해시 캐시(snapshots/.local_contents_cache.json)를 로드한다."""
     if not cache_path:
@@ -83,20 +108,8 @@ def load_local_contents_cache(cache_path: PathLike | None) -> dict[str, dict]:
         return {}
     out: dict[str, dict] = {}
     for key, val in raw.items():
-        if isinstance(key, str) and isinstance(val, dict):
-            sha = str(val.get("sha256", "")).lower()
-            size = val.get("size_bytes")
-            mtime_ns = val.get("mtime_ns")
-            if (
-                _SHA256_RE.match(sha)
-                and type(size) is int
-                and type(mtime_ns) is int
-            ):
-                out[normalize_nfc(key)] = {
-                    "size_bytes": size,
-                    "mtime_ns": mtime_ns,
-                    "sha256": sha,
-                }
+        if (parsed := _parse_local_cache_entry(key, val)) is not None:
+            out[parsed[0]] = parsed[1]
     return out
 
 
@@ -176,6 +189,45 @@ def scan_workspace_contents(
     return entries, cache_hits, recomputed
 
 
+def _normalize_drive_record(raw: Record) -> dict[str, Any]:
+    """드라이브 스냅샷 레코드의 파일명과 폴더 경로를 NFC로 정규화한 사본을 반환한다."""
+    return {
+        **dict(raw),
+        "name": normalize_nfc(raw.get("name")),
+        "folder_path": normalize_nfc(raw.get("folder_path")),
+    }
+
+
+def _drive_record_sort_key(record: Record) -> tuple[str, str, str]:
+    """드라이브 레코드를 (폴더 경로, 파일명, 파일 ID) 순으로 정렬하는 키."""
+    return (record["folder_path"], record["name"], str(record.get("id", "")))
+
+
+def _group_drive_by_sha(drive_records: Iterable[Record]) -> tuple[dict[str, list[dict]], list[dict]]:
+    drive_by_sha: dict[str, list[dict]] = {}
+    drive_without_sha: list[dict] = []
+    for raw in drive_records:
+        rec = _normalize_drive_record(raw)
+        sha = str(rec.get("sha256") or "").strip().lower()
+        (drive_by_sha.setdefault(sha, []) if sha else drive_without_sha).append(rec)
+    return drive_by_sha, drive_without_sha
+
+
+def _group_local_by_sha(
+    local_entries: Iterable[LocalPdfEntry],
+) -> tuple[dict[str, list[LocalPdfEntry]], list[LocalPdfEntry]]:
+    local_by_sha: dict[str, list[LocalPdfEntry]] = {}
+    local_without_sha: list[LocalPdfEntry] = []
+    for entry in local_entries:
+        norm_entry = LocalPdfEntry(
+            relative_path=normalize_nfc(entry.relative_path),
+            sha256=entry.sha256.strip().lower(),
+        )
+        target = local_by_sha.setdefault(norm_entry.sha256, []) if norm_entry.sha256 else local_without_sha
+        target.append(norm_entry)
+    return local_by_sha, local_without_sha
+
+
 def compare_drive_and_local(
     drive_records: Iterable[Record],
     local_entries: Iterable[LocalPdfEntry],
@@ -184,24 +236,8 @@ def compare_drive_and_local(
     recomputed: int = 0,
 ) -> SyncComparisonResult:
     """드라이브 스냅샷 레코드와 로컬 PDF 엔트리를 SHA-256 해시 기준으로 3-Way 대조한다."""
-    drive_by_sha: dict[str, list[dict]] = {}
-    drive_without_sha: list[dict] = []
-
-    for raw in drive_records:
-        rec = {
-            **dict(raw),
-            "name": normalize_nfc(raw.get("name")),
-            "folder_path": normalize_nfc(raw.get("folder_path")),
-        }
-        sha = str(rec.get("sha256") or "").strip().lower()
-        if sha:
-            drive_by_sha.setdefault(sha, []).append(rec)
-        else:
-            drive_without_sha.append(rec)
-
-    local_by_sha: dict[str, list[LocalPdfEntry]] = {}
-    for entry in local_entries:
-        local_by_sha.setdefault(entry.sha256.lower(), []).append(entry)
+    drive_by_sha, drive_without_sha = _group_drive_by_sha(drive_records)
+    local_by_sha, local_without_sha = _group_local_by_sha(local_entries)
 
     drive_shas = set(drive_by_sha.keys())
     local_shas = set(local_by_sha.keys())
@@ -209,19 +245,16 @@ def compare_drive_and_local(
     drive_only: list[dict] = list(drive_without_sha)
     for sha in drive_shas - local_shas:
         drive_only.extend(drive_by_sha[sha])
-    drive_only.sort(key=lambda r: (r["folder_path"], r["name"], str(r.get("id", ""))))
+    drive_only.sort(key=_drive_record_sort_key)
 
-    local_only: list[LocalPdfEntry] = []
+    local_only: list[LocalPdfEntry] = list(local_without_sha)
     for sha in local_shas - drive_shas:
         local_only.extend(local_by_sha[sha])
-    local_only.sort(key=lambda e: e.relative_path)
+    local_only.sort(key=lambda e: (e.relative_path, e.sha256))
 
     matched: list[MatchedPdfGroup] = []
     for sha in drive_shas & local_shas:
-        d_recs = sorted(
-            drive_by_sha[sha],
-            key=lambda r: (r["folder_path"], r["name"], str(r.get("id", ""))),
-        )
+        d_recs = sorted(drive_by_sha[sha], key=_drive_record_sort_key)
         l_ents = sorted(local_by_sha[sha], key=lambda e: e.relative_path)
         matched.append(
             MatchedPdfGroup(
@@ -241,6 +274,12 @@ def compare_drive_and_local(
     )
 
 
+def _format_matched_group(group: MatchedPdfGroup) -> str:
+    d_name = group.drive_records[0]["name"]
+    locs = ", ".join(e.relative_path for e in group.local_entries)
+    return f"- {d_name} ⟷ {locs} (sha256={group.sha256[:12]}...)"
+
+
 def format_sync_report(result: SyncComparisonResult, total_drive: int, total_local: int) -> str:
     """3-Way 동기화 비교 결과를 터미널 출력용 문자열로 포맷한다."""
     lines = [
@@ -253,32 +292,41 @@ def format_sync_report(result: SyncComparisonResult, total_drive: int, total_loc
         f"[양쪽 일치 (Matched: {len(result.matched)}권)]",
     ]
     if result.matched:
-        for group in result.matched:
-            d_name = group.drive_records[0]["name"]
-            locs = ", ".join(e.relative_path for e in group.local_entries)
-            lines.append(f"- {d_name} ⟷ {locs} (sha256={group.sha256[:12]}...)")
+        lines.extend(_format_matched_group(group) for group in result.matched)
     else:
         lines.append("양쪽 일치하는 도서가 없습니다.")
 
-    lines.append("")
-    lines.append(f"[드라이브에만 있는 것 (Drive Only: {len(result.drive_only)}권)]")
+    lines.extend(["", f"[드라이브에만 있는 것 (Drive Only: {len(result.drive_only)}권)]"])
     if result.drive_only:
-        for rec in result.drive_only:
-            folder = rec["folder_path"]
-            loc = f"{folder}/{rec['name']}" if folder else rec["name"]
-            lines.append(f"- {rec['name']} (id={rec.get('id', '')}, path={loc})")
+        lines.extend(
+            f"- {rec['name']} (id={rec.get('id', '')}, path={format_record_path(rec)})"
+            for rec in result.drive_only
+        )
     else:
         lines.append("드라이브 전용 도서가 없습니다.")
 
-    lines.append("")
-    lines.append(f"[로컬에만 있는 것 (Local Only: {len(result.local_only)}개)]")
+    lines.extend(["", f"[로컬에만 있는 것 (Local Only: {len(result.local_only)}개)]"])
     if result.local_only:
-        for entry in result.local_only:
-            lines.append(f"- {entry.relative_path} (sha256={entry.sha256[:12]}...)")
+        lines.extend(
+            f"- {entry.relative_path} (sha256={entry.sha256[:12]}...)"
+            for entry in result.local_only
+        )
     else:
         lines.append("로컬 전용 도서가 없습니다.")
 
     return "\n".join(lines) + "\n"
+
+
+def _raise_if_ambiguous_or_return_single(
+    matches: list[dict],
+    ambiguous_message: str,
+) -> dict | None:
+    """매칭된 레코드가 1건이면 반환하고, 2건 이상이면 ClassificationError를 발생시킨다."""
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ClassificationError(ambiguous_message)
+    return None
 
 
 def resolve_drive_record_for_pull(records: Iterable[Record], query: str) -> dict:
@@ -287,43 +335,102 @@ def resolve_drive_record_for_pull(records: Iterable[Record], query: str) -> dict
     if not norm_q:
         raise ClassificationError("가져올 도서 식별자(파일 ID, SHA-256 또는 도서명)를 지정하세요.")
 
-    recs = [
-        {
-            **dict(r),
-            "name": normalize_nfc(r.get("name")),
-            "folder_path": normalize_nfc(r.get("folder_path")),
-        }
-        for r in records
-    ]
+    recs = [_normalize_drive_record(r) for r in records]
+    q_lower = norm_q.lower()
 
     for rec in recs:
         if str(rec.get("id", "")) == norm_q:
             return rec
-        if str(rec.get("sha256", "")).lower() == norm_q.lower() and norm_q:
-            return rec
 
-    q_lower = norm_q.lower()
+    sha_matches = [
+        r for r in recs if str(r.get("sha256") or "").strip().lower() == q_lower
+    ]
+    if (
+        matched := _raise_if_ambiguous_or_return_single(
+            sha_matches,
+            f"동일한 SHA-256 해시의 도서가 {len(sha_matches)}권 있습니다. 파일 ID로 지정하세요: "
+            f"{', '.join(str(r.get('id', '')) for r in sha_matches)}",
+        )
+    ) is not None:
+        return matched
+
     q_pdf = q_lower if q_lower.endswith(".pdf") else f"{q_lower}.pdf"
     exact_name_matches = [
         r for r in recs if r["name"].lower() in (q_lower, q_pdf)
     ]
-    if len(exact_name_matches) == 1:
-        return exact_name_matches[0]
-    if len(exact_name_matches) > 1:
-        ids = ", ".join(str(r.get("id", "")) for r in exact_name_matches)
-        raise ClassificationError(
-            f"동일한 이름의 도서가 {len(exact_name_matches)}권 있습니다. 파일 ID로 지정하세요: {ids}"
+    if (
+        matched := _raise_if_ambiguous_or_return_single(
+            exact_name_matches,
+            f"동일한 이름의 도서가 {len(exact_name_matches)}권 있습니다. 파일 ID로 지정하세요: "
+            f"{', '.join(str(r.get('id', '')) for r in exact_name_matches)}",
         )
+    ) is not None:
+        return matched
 
     sub_matches = [r for r in recs if q_lower in r["name"].lower()]
-    if len(sub_matches) == 1:
-        return sub_matches[0]
-    if len(sub_matches) > 1:
-        candidates = ", ".join(f"{r['name']}({r.get('id', '')})" for r in sub_matches[:5])
-        raise ClassificationError(
-            f"검색어 {norm_q!r}와 일치하는 도서가 {len(sub_matches)}권 있습니다. 더 구체적으로 지정하세요: {candidates}"
+    candidates = ", ".join(f"{r['name']}({r.get('id', '')})" for r in sub_matches[:5])
+    if (
+        matched := _raise_if_ambiguous_or_return_single(
+            sub_matches,
+            f"검색어 {norm_q!r}와 일치하는 도서가 {len(sub_matches)}권 있습니다. 더 구체적으로 지정하세요: {candidates}",
         )
+    ) is not None:
+        return matched
+
     raise ClassificationError(f"스냅샷에서 {norm_q!r} 도서를 찾을 수 없습니다.")
+
+
+_UNSAFE_FILENAME_CHARS_TABLE: Mapping[int, str] = MappingProxyType(
+    str.maketrans(
+        {
+            **dict.fromkeys((*range(32), *range(127, 160), 0x2028, 0x2029), " "),
+            "/": "-",
+            "\\": "-",
+        }
+    )
+)
+_LEADING_DOT_OR_SPACE_RE = re.compile(r"^[\s.]+")
+_TRIVIAL_STEM_CHARS_RE = re.compile(r"[\s.\-]+")
+
+
+def _clean_filename_candidate(raw: str | None) -> str:
+    if raw is None:
+        return ""
+    translated = normalize_nfc(raw).translate(_UNSAFE_FILENAME_CHARS_TABLE)
+    return "".join(ch if ch.isprintable() else " " for ch in translated).strip()
+
+
+def _sanitize_pdf_filename(output_name: str | None, fallback_name: str) -> str:
+    """출력 파일명에서 경로 구분자와 위험 문자를 제거하고 .pdf 확장자를 보장한다."""
+    raw_filename = _clean_filename_candidate(output_name) or _clean_filename_candidate(fallback_name)
+    safe_stem = normalize_nfc(_LEADING_DOT_OR_SPACE_RE.sub("", raw_filename))
+    stem_body = safe_stem[:-4] if safe_stem.lower().endswith(".pdf") else safe_stem
+    if not _TRIVIAL_STEM_CHARS_RE.sub("", stem_body) or safe_stem.lower() == "pdf":
+        raise ClassificationError(f"유효하지 않은 출력 파일명입니다: {output_name or fallback_name!r}")
+    return safe_stem if safe_stem.lower().endswith(".pdf") else f"{safe_stem}.pdf"
+
+
+def _parse_safe_path_segments(raw_path: str, error_label: str) -> tuple[str, ...]:
+    """슬래시(/)로 구분된 상대 경로 문자열의 모든 세그먼트가 안전한지 검증해 튜플로 반환한다."""
+    norm = normalize_nfc(raw_path).strip().strip("/")
+    if not norm or not norm.isprintable() or "\\" in norm:
+        raise ClassificationError(f"유효하지 않은 {error_label}입니다: {raw_path!r}")
+    parts = tuple(norm.split("/"))
+    if any(not p or not p.strip() or p in (".", "..") for p in parts):
+        raise ClassificationError(f"유효하지 않은 {error_label}입니다: {raw_path!r}")
+    return parts
+
+
+def _resolve_pull_target_dir(ws: Path, project: str, subdir: str | None = None) -> Path:
+    """대상 프로젝트 경로(<project> 또는 <project>/<트랙>/<슬러그>)와 --subdir로부터 contents/ 하위 대상 폴더를 결정한다."""
+    proj_parts = _parse_safe_path_segments(project, "대상 프로젝트 이름")
+    project_root = proj_parts[0]
+    inline_sub = proj_parts[2:] if len(proj_parts) > 1 and proj_parts[1] == "contents" else proj_parts[1:]
+    extra_sub: tuple[str, ...] = ()
+    if subdir is not None:
+        sub_parts = _parse_safe_path_segments(subdir, "하위 경로(subdir)")
+        extra_sub = sub_parts[1:] if sub_parts[0] == "contents" else sub_parts
+    return ws.joinpath(project_root, "contents", *inline_sub, *extra_sub)
 
 
 def pull_drive_pdf_to_project(
@@ -333,21 +440,16 @@ def pull_drive_pdf_to_project(
     project: str,
     *,
     workspace_dir: PathLike,
-    output_name: str | None = None,
-    cache_path: PathLike | None = None,
+    subdir: str | None = None,
+    **options: Any,
 ) -> tuple[dict, Path]:
-    """스냅샷에서 도서를 찾아 지정한 로컬 프로젝트의 contents/ 폴더로 내려받고 해시 캐시를 갱신한다."""
+    """스냅샷에서 도서를 찾아 지정한 로컬 프로젝트의 contents/(및 하위 경로) 폴더로 내려받고 해시 캐시를 갱신한다."""
     rec = resolve_drive_record_for_pull(records, query)
     ws = Path(workspace_dir).resolve()
-    proj_norm = normalize_nfc(project).strip().strip("/")
-    if not proj_norm or ".." in Path(proj_norm).parts:
-        raise ClassificationError(f"유효하지 않은 대상 프로젝트 이름입니다: {project!r}")
-
-    target_contents_dir = ws / proj_norm / "contents"
-    raw_filename = normalize_nfc(output_name or rec["name"]).strip()
-    safe_filename = raw_filename.replace("/", "-")
-    if not safe_filename.lower().endswith(".pdf"):
-        safe_filename = f"{safe_filename}.pdf"
+    target_contents_dir = _resolve_pull_target_dir(ws, project, subdir=subdir)
+    output_name: str | None = options.get("output_name")
+    cache_path: PathLike | None = options.get("cache_path")
+    safe_filename = _sanitize_pdf_filename(output_name, rec["name"])
 
     dest_path = target_contents_dir / safe_filename
     file_id = str(rec["id"])

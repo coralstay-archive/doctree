@@ -2,10 +2,16 @@
 import copy
 import inspect
 import types
+import unicodedata
 import unittest
 from unittest import mock
 
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
+
 from doctree.content_taxonomy import duplicate_and_naming_linter as checks
+from doctree.content_taxonomy.practice_kata_builder import _slugify
+from doctree.runtime_env.workspace_settings import normalize_nfc
 
 
 def _rec(id_, name, folder="IT/개발", sha256="m", size=1):
@@ -179,14 +185,69 @@ class TestRunChecks(unittest.TestCase):
         self.assertEqual(checks.title_key("Copy of \u1100\u1161 - 나 다.PDF"), "가나다")
         # 끝에 .pdf가 두 번 있으면 마지막 확장자 하나만 제거됨
         self.assertEqual(checks.title_key("archive.pdf.PDF"), "archive.pdf")
-        # None 또는 빈 문자열 입력 시 빈 문자열 반환
+        # None 또는 빈 문자열 또는 공백/하이픈만 있는 파일명은 빈 title_key가 되어 동명 그룹에서 제외됨
         self.assertEqual(checks.title_key(""), "")
+        self.assertEqual(
+            checks.find_same_title_different_content(
+                [_rec("e1", "---.pdf", sha256="s1"), _rec("e2", "   .pdf", sha256="s2")]
+            ),
+            [],
+        )
         # folder_path가 빈 문자열("")인 루트 파일은 앞에 '/'가 붙지 않는다
         root_rec = _rec("root1", "루트파일", folder="")
         ws = checks.find_filename_issues([root_rec])
         self.assertEqual(len(ws), 1)
         self.assertEqual(ws[0].message, "파일명에 .pdf 확장자가 없음: 루트파일")
 
+    @settings(max_examples=80, deadline=None)
+    @given(raw_text=st.text(max_size=60), idx=st.integers(min_value=1, max_value=99))
+    @example(raw_text="Copy of \u1100\u1161\u11a8 - \t\n 리팩터링.PDF", idx=1)
+    @example(raw_text="___///\x00\x7f___", idx=7)
+    @example(raw_text="---.pdf\n", idx=3)
+    def test_property_fuzz_unicode_normalization_and_slug_idempotence(self, raw_text: str, idx: int) -> None:
+        """임의 유니코드(NFD 자모·제어문자·공백·특수문자)에 대해 normalize_nfc·_slugify 멱등성과 title_key·run_checks 순열 불변성을 검증한다."""
+        nfd_text = unicodedata.normalize("NFD", raw_text)
+        nfc_text = normalize_nfc(raw_text)
+        self.assertEqual(normalize_nfc(nfc_text), nfc_text)
+        self.assertEqual(normalize_nfc(nfd_text), nfc_text)
+        self.assertEqual(checks.title_key(nfd_text), checks.title_key(nfc_text))
+
+        slug = _slugify(raw_text, idx)
+        self.assertEqual(_slugify(slug, idx), slug)
+        self.assertEqual(_slugify(nfd_text, idx), slug)
+
+        recs = [_rec("r1", nfd_text, sha256="sha-1"), _rec("r2", nfc_text, folder="   / ", sha256="sha-2")]
+        self.assertEqual(checks.run_checks(recs), checks.run_checks(list(reversed(recs))))
+
+    def test_metamorphic_record_cloning_and_title_noise_invariance(self) -> None:
+        """메타모픽 관계: 동일 SHA-256 복제 시 완전 중복만 증가하고, 제목 노이즈 주입 시 동명 이본 그룹은 불변이다."""
+        base_records = [
+            _rec("id-1", "알고리즘개론.pdf", sha256="sha-alpha"),
+            _rec("id-2", "클린아키텍처.pdf", sha256="sha-beta-1"),
+            _rec("id-3", "클린아키텍처.pdf", folder="백업", sha256="sha-beta-2"),
+        ]
+        before_exact = checks.find_exact_duplicates(base_records)
+        before_same_title = checks.find_same_title_different_content(base_records)
+        self.assertEqual(len(before_exact), 0)
+        self.assertEqual(len(before_same_title), 1)
+
+        cloned_records = [*base_records, _rec("id-1-clone", "복사본.pdf", folder="백업", sha256="sha-alpha")]
+        after_exact = checks.find_exact_duplicates(cloned_records)
+        after_same_title = checks.find_same_title_different_content(cloned_records)
+        self.assertEqual(len(after_exact), 1)
+        self.assertEqual(_ids(after_exact[0]), ["id-1", "id-1-clone"])
+        self.assertEqual(after_same_title, before_same_title)
+
+        noisy_title = unicodedata.normalize("NFD", "Copy of 클린 - 아키텍처.PDF")
+        noisy_records = [
+            _rec("id-2", noisy_title, sha256="sha-beta-1"),
+            _rec("id-3", "클린아키텍처.pdf", folder="백업", sha256="sha-beta-2"),
+        ]
+        noisy_same_title = checks.find_same_title_different_content(noisy_records)
+        self.assertEqual([_ids(w) for w in noisy_same_title], [["id-2", "id-3"]])
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

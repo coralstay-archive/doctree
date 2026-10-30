@@ -11,7 +11,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from doctree.runtime_env.workspace_settings import normalize_nfc
+from doctree.runtime_env.workspace_settings import format_record_path, normalize_nfc
 
 __all__ = [
     "CheckWarning",
@@ -25,7 +25,7 @@ __all__ = [
 
 Record = dict
 
-_PDF_SUFFIX = re.compile(r"\.pdf$", re.IGNORECASE)
+_PDF_SUFFIX = re.compile(r"\.pdf\Z", re.IGNORECASE)
 _COPY_OF_PREFIX = re.compile(r"^Copy of ")
 _IGNORED = re.compile(r"[-\s]+")
 
@@ -46,14 +46,14 @@ def title_key(name: str) -> str:
     순서: NFC 정규화 → 끝의 '.pdf'(대소문자 무시) 제거 → 앞의 'Copy of ' 제거
     → 하이픈·공백 제거 → 소문자화.
     """
-    s = normalize_nfc(name)
-    s = _PDF_SUFFIX.sub("", s)
-    s = _COPY_OF_PREFIX.sub("", s)
-    s = _IGNORED.sub("", s)
-    return s.lower()
+    normalized_title = normalize_nfc(name)
+    normalized_title = _PDF_SUFFIX.sub("", normalized_title)
+    normalized_title = _COPY_OF_PREFIX.sub("", normalized_title)
+    normalized_title = _IGNORED.sub("", normalized_title)
+    return normalized_title.lower()
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class CheckWarning:
     """점검 경고 하나. kind는 안정적인 식별 문자열(WarningKind), files는 관련 레코드, message는 한국어 설명."""
 
@@ -62,60 +62,60 @@ class CheckWarning:
     message: str
 
 
-def _path(rec: Record) -> str:
-    folder = normalize_nfc(rec.get("folder_path"))
-    name = normalize_nfc(rec.get("name"))
-    return f"{folder}/{name}" if folder else name
+def _warning_sort_key(warning: CheckWarning) -> tuple[str, str]:
+    first_record = warning.files[0]
+    return (format_record_path(first_record), first_record.get("id") or "")
 
 
-def _order(w: CheckWarning):
-    return (_path(w.files[0]), w.files[0].get("id") or "")
+def _sort_records(records: Iterable[Record]) -> list[Record]:
+    return sorted(records, key=lambda rec: (format_record_path(rec), rec.get("id") or ""))
 
 
-def _sorted(recs: Iterable[Record]) -> list[Record]:
-    return sorted(recs, key=lambda r: (_path(r), r.get("id") or ""))
+def _format_record_paths(records: Iterable[Record]) -> str:
+    return ", ".join(format_record_path(rec) for rec in records)
 
 
-def _paths(recs: Iterable[Record]) -> str:
-    return ", ".join(_path(r) for r in recs)
+def _normalized_sha256(record: Record) -> str:
+    return str(record.get("sha256") or "").strip().lower()
 
 
 def find_exact_duplicates(records: Iterable[Record]) -> list[CheckWarning]:
     """SHA-256이 같은 파일 묶음마다 '완전 중복' 경고. SHA-256이 빈 파일은 묶지 않는다 (B1: 이름 무관)."""
     groups: dict[str, list[Record]] = defaultdict(list)
     for rec in records:
-        sha256 = rec.get("sha256")
+        sha256 = _normalized_sha256(rec)
         if sha256:
             groups[sha256].append(rec)
     warnings = []
     for members in groups.values():
         if len(members) < 2:
             continue
-        files = _sorted(members)
+        files = _sort_records(members)
         warnings.append(CheckWarning(
             kind=WarningKind.EXACT_DUPLICATE,
             files=files,
-            message=f"완전 중복 {len(files)}개 (SHA-256 동일): {_paths(files)}",
+            message=f"완전 중복 {len(files)}개 (SHA-256 동일): {_format_record_paths(files)}",
         ))
-    return sorted(warnings, key=_order)
+    return sorted(warnings, key=_warning_sort_key)
 
 
 def find_same_title_different_content(records: Iterable[Record]) -> list[CheckWarning]:
     """제목 키가 같지만 SHA-256 값이 2종 이상인 묶음마다 '동명 다른 파일' 경고."""
     groups: dict[str, list[Record]] = defaultdict(list)
     for rec in records:
-        groups[title_key(rec.get("name") or "")].append(rec)
+        if key := title_key(rec.get("name") or ""):
+            groups[key].append(rec)
     warnings = []
     for members in groups.values():
-        if len(members) < 2 or len({m.get("sha256") or "" for m in members}) < 2:
+        if len(members) < 2 or len({_normalized_sha256(m) for m in members}) < 2:
             continue
-        files = _sorted(members)
+        files = _sort_records(members)
         warnings.append(CheckWarning(
             kind=WarningKind.SAME_TITLE_DIFFERENT_CONTENT,
             files=files,
-            message=f"동명 다른 파일 {len(files)}개 (제목 같고 SHA-256 다름): {_paths(files)}",
+            message=f"동명 다른 파일 {len(files)}개 (제목 같고 SHA-256 다름): {_format_record_paths(files)}",
         ))
-    return sorted(warnings, key=_order)
+    return sorted(warnings, key=_warning_sort_key)
 
 
 _FILENAME_KINDS = (
@@ -130,7 +130,7 @@ def find_filename_issues(records: Iterable[Record]) -> list[CheckWarning]:
     found: dict[WarningKind, list[CheckWarning]] = {k: [] for k in _FILENAME_KINDS}
     for rec in records:
         name = normalize_nfc(rec.get("name"))
-        path = _path(rec)
+        path = format_record_path(rec)
         if not name.lower().endswith(".pdf"):
             found[WarningKind.MISSING_PDF_EXTENSION].append(CheckWarning(
                 kind=WarningKind.MISSING_PDF_EXTENSION, files=[rec],
@@ -145,7 +145,7 @@ def find_filename_issues(records: Iterable[Record]) -> list[CheckWarning]:
                 message=f"파일명 앞뒤에 공백이 있음: {path!r}"))
     warnings: list[CheckWarning] = []
     for kind in _FILENAME_KINDS:
-        warnings.extend(sorted(found[kind], key=_order))
+        warnings.extend(sorted(found[kind], key=_warning_sort_key))
     return warnings
 
 

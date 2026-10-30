@@ -58,7 +58,7 @@ contents:
 
 
 def _section(text: str, header: str) -> str:
-    m = re.search(rf"^\[{re.escape(header)}\]\s*$(.*?)(?=^\[|\Z)", text, re.S | re.M)
+    m = re.search(rf"^\[{re.escape(header)}\]\s*$(.*?)(?=^\[|\Z)", text, re.DOTALL | re.MULTILINE)
     return m.group(1) if m else ""
 
 
@@ -878,19 +878,22 @@ def test_e2e_cli_binary_subprocess_classify_audit_and_update_guard(tmp_path):
             assert expected_line in res.stdout, f"[{spec_name}] missing {expected_line!r} in:\n{res.stdout}"
 
     # E2E 1) --version, --help, help, auth, status, classify(엄격/비엄격/미분류 차단), audit(클린), sync, scaffold, parse, practice 골든 트랜스크립트 검증
-    _assert_transcript("version_flag")
-    _assert_transcript("help_all_commands")
-    _assert_transcript("help_subcommand_topic")
-    _assert_transcript("auth_without_credentials")
-    _assert_transcript("status_without_credentials")
-    _assert_transcript("classify_strict_clean")
-    _assert_transcript("classify_non_strict_unclassified_review")
-    _assert_transcript("classify_strict_unclassified_rejected")
-    _assert_transcript("audit_strict_clean")
-    _assert_transcript("sync_3way_comparison")
-    _assert_transcript("scaffold_handcrafted_project")
-    _assert_transcript("parse_verify_pdf")
-    _assert_transcript("practice_generate_katas")
+    for spec_name in (
+        "version_flag",
+        "help_all_commands",
+        "help_subcommand_topic",
+        "auth_without_credentials",
+        "status_without_credentials",
+        "classify_strict_clean",
+        "classify_non_strict_unclassified_review",
+        "classify_strict_unclassified_rejected",
+        "audit_strict_clean",
+        "sync_3way_comparison",
+        "scaffold_handcrafted_project",
+        "parse_verify_pdf",
+        "practice_generate_katas",
+    ):
+        _assert_transcript(spec_name)
 
     # E2E 2) 로컬 워크스페이스에 악성 스크립트(/JavaScript) PDF 유입 후 audit_strict_infected_pdf 검증
     infected_pdf = proj_threat / "malicious_autoopen.pdf"

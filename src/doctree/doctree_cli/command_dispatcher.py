@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -13,10 +15,22 @@ from doctree.content_taxonomy.category_classifier import (
     load_catalog,
 )
 from doctree.content_taxonomy.duplicate_and_naming_linter import run_checks
-from doctree.content_taxonomy.practice_kata_builder import build_practice_katas
+from doctree.content_taxonomy.practice_kata_builder import (
+    backfill_practice_pitfalls,
+    build_practice_katas,
+    verify_practice_katas,
+)
+from doctree.content_taxonomy.snippet_registry import (
+    export_snippets_blog_posts,
+    export_snippets_markdown,
+    format_snippets_report,
+    sync_snippet_registry,
+    verify_snippet,
+)
 from doctree.doctree_cli.terminal_tree_renderer import (
     console,
     format_classification_summary,
+    format_local_audit_reasons,
     print_account_dashboard,
 )
 from doctree.drive_sync.drive_pdf_fetcher import DriveListError, GoogleDriveManager
@@ -24,6 +38,7 @@ from doctree.drive_sync.snapshot_diff_tracker import (
     KST,
     change_summary,
     load_latest_snapshot,
+    load_snapshot_records,
     record_run,
 )
 from doctree.drive_sync.workspace_sync_engine import (
@@ -33,7 +48,6 @@ from doctree.drive_sync.workspace_sync_engine import (
     pull_drive_pdf_to_project,
     scan_workspace_contents,
 )
-from doctree.pdf_threat_audit.pdf_byte_inspector import discover_local_pdfs
 from doctree.pdf_threat_audit.pdf_page_ingestor import parse_pdf_to_content_data
 from doctree.pdf_threat_audit.threat_intel_client import audit_drive_records, audit_local_pdfs
 from doctree.runtime_env.boundary_errors import (
@@ -66,6 +80,7 @@ from doctree.runtime_env.workspace_settings import (
     VIRUSTOTAL_API_KEY,
     VT_CACHE_FILE,
     WORKSPACE_DIR,
+    discover_local_pdfs,
 )
 
 __all__ = [
@@ -81,6 +96,7 @@ __all__ = [
     "cmd_practice",
     "cmd_pull",
     "cmd_scaffold",
+    "cmd_snippet",
     "cmd_status",
     "cmd_sync",
     "cmd_update",
@@ -115,6 +131,33 @@ def _render_boundary_error(
     return 1
 
 
+_CLI_CAUGHT_ERRORS = (DoctreeBoundaryError, OSError, UnicodeError, json.JSONDecodeError)
+
+
+def _boundary_guarded(
+    default_boundary: BoundaryKind = BoundaryKind.FILESYSTEM,
+    *,
+    preserve_snapshot: bool = False,
+) -> Callable[[Callable[[argparse.Namespace], int]], Callable[[argparse.Namespace], int]]:
+    """CLI 커맨드 핸들러의 경계 예외를 일관되게 포착해 _render_boundary_error로 위임하는 데코레이터."""
+
+    def decorator(func: Callable[[argparse.Namespace], int]) -> Callable[[argparse.Namespace], int]:
+        @functools.wraps(func)
+        def wrapper(args: argparse.Namespace) -> int:
+            try:
+                return func(args)
+            except _CLI_CAUGHT_ERRORS as error:
+                return _render_boundary_error(
+                    error,
+                    default_boundary=default_boundary,
+                    preserve_snapshot=preserve_snapshot,
+                )
+
+        return wrapper
+
+    return decorator
+
+
 def _print_account(drive: GoogleDriveManager) -> int:
     if not drive.service:
         return _render_boundary_error(DriveAuthError(AUTH_MISSING_MESSAGE))
@@ -143,19 +186,6 @@ def now_kst() -> datetime:
     return datetime.now(KST)
 
 
-def _load_snapshot(path: Path) -> list:
-    """로컬 스냅샷만 읽는다. 잘못된 입력을 빈 도서 목록으로 처리하지 않는다."""
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or not isinstance(data.get("records"), list):
-        raise ClassificationError("스냅샷에는 records 배열이 필요합니다.")
-    records = data["records"]
-    if "count" in data and (
-        type(data["count"]) is not int or data["count"] != len(records)
-    ):
-        raise ClassificationError("스냅샷 count와 records 개수가 일치하지 않습니다.")
-    return records
-
-
 def _resolve_snapshot_records(
     snapshot: Path | None,
     snapshots_dir: Path,
@@ -163,7 +193,7 @@ def _resolve_snapshot_records(
     required: bool = True,
 ) -> list:
     if snapshot is not None:
-        return _load_snapshot(snapshot)
+        return load_snapshot_records(snapshot, error_cls=ClassificationError)
     latest = load_latest_snapshot(snapshots_dir)
     if latest is None:
         if not required:
@@ -175,19 +205,18 @@ def _resolve_snapshot_records(
     return records
 
 
+@_boundary_guarded(BoundaryKind.TAXONOMY)
 def cmd_classify(args: argparse.Namespace) -> int:
     """고정 분류표로 로컬 스냅샷을 검토하여 터미널에 출력한다. Drive 인증·조회는 수행하지 않는다."""
-    try:
-        catalog = load_catalog(args.category_tree, args.content_map)
-        records = _resolve_snapshot_records(args.snapshot, Path(SNAPSHOTS_DIR))
-        result = classify_records(records, catalog, strict=args.strict)
-        summary = format_classification_summary(result)
-        console.print(summary, markup=False, highlight=False, soft_wrap=True, end="")
-        return 0
-    except (DoctreeBoundaryError, OSError, UnicodeError, json.JSONDecodeError) as error:
-        return _render_boundary_error(error, default_boundary=BoundaryKind.TAXONOMY)
+    catalog = load_catalog(args.category_tree, args.content_map)
+    records = _resolve_snapshot_records(args.snapshot, Path(SNAPSHOTS_DIR))
+    result = classify_records(records, catalog, strict=args.strict)
+    summary = format_classification_summary(result)
+    console.print(summary, markup=False, highlight=False, soft_wrap=True, end="")
+    return 0
 
 
+@_boundary_guarded(BoundaryKind.FILESYSTEM, preserve_snapshot=True)
 def cmd_update(args: argparse.Namespace) -> int:
     """조회 → 분류 → 점검 → snapshots/YYYY-MM-DD.json 저장 및 터미널 요약 출력."""
     snapshots_dir = Path(args.snapshots_dir or SNAPSHOTS_DIR)
@@ -195,41 +224,34 @@ def cmd_update(args: argparse.Namespace) -> int:
     content_map_path = Path(args.content_map or CONTENT_CATEGORY_MAP_FILE)
     console.print("\n[bold cyan]📚 콘텐츠 스냅샷 갱신[/bold cyan]", soft_wrap=True)
 
-    try:
-        drive = build_drive()
-        if not drive.service:
-            raise DriveAuthError(AUTH_MISSING_MESSAGE, preserve_snapshot=True)
-        records = drive.list_pdf_files()
-        if not records:
-            raise DriveListError(
-                "드라이브에서 PDF를 0개 조회했습니다. 빈 스냅샷을 막기 위해 중단합니다 (폴더 ID·권한 확인).",
-                preserve_snapshot=True,
-            )
-
-        catalog = load_catalog(category_tree_path, content_map_path)
-        result = classify_records(records, catalog, strict=args.strict)
-
-        warnings = run_checks(records)
-        vt_checked, vt_flagged = audit_drive_records(
-            records,
-            api_key=VIRUSTOTAL_API_KEY or None,
-            cache_path=VT_CACHE_FILE,
-        )
-        if vt_flagged and args.strict:
-            flagged_names = ", ".join(r.get("name", r.get("id", "")) for r, _ in vt_flagged)
-            raise SecurityAuditError(
-                f"VirusTotal 위협 감지 {len(vt_flagged)}건: {flagged_names}",
-                preserve_snapshot=True,
-            )
-
-        now = now_kst()
-        run = record_run(records, snapshots_dir, now)
-    except (DoctreeBoundaryError, OSError, UnicodeError, json.JSONDecodeError) as error:
-        return _render_boundary_error(
-            error,
-            default_boundary=BoundaryKind.FILESYSTEM,
+    drive = build_drive()
+    if not drive.service:
+        raise DriveAuthError(AUTH_MISSING_MESSAGE, preserve_snapshot=True)
+    records = drive.list_pdf_files()
+    if not records:
+        raise DriveListError(
+            "드라이브에서 PDF를 0개 조회했습니다. 빈 스냅샷을 막기 위해 중단합니다 (폴더 ID·권한 확인).",
             preserve_snapshot=True,
         )
+
+    catalog = load_catalog(category_tree_path, content_map_path)
+    result = classify_records(records, catalog, strict=args.strict)
+
+    warnings = run_checks(records)
+    vt_checked, vt_flagged = audit_drive_records(
+        records,
+        api_key=VIRUSTOTAL_API_KEY or None,
+        cache_path=VT_CACHE_FILE,
+    )
+    if vt_flagged and args.strict:
+        flagged_names = ", ".join(r.get("name", r.get("id", "")) for r, _ in vt_flagged)
+        raise SecurityAuditError(
+            f"VirusTotal 위협 감지 {len(vt_flagged)}건: {flagged_names}",
+            preserve_snapshot=True,
+        )
+
+    now = now_kst()
+    run = record_run(records, snapshots_dir, now)
 
     unclassified = len(result.unclassified)
     console.print(
@@ -247,20 +269,18 @@ def cmd_update(args: argparse.Namespace) -> int:
     return 0
 
 
+@_boundary_guarded(BoundaryKind.FILESYSTEM)
 def cmd_audit(args: argparse.Namespace) -> int:
     """드라이브 스냅샷(SHA-256) 및 로컬 contents/*.pdf 보안·무결성 점검을 수행한다."""
     snapshots_dir = Path(args.snapshots_dir or SNAPSHOTS_DIR)
     api_key = args.vt_api_key if args.vt_api_key is not None else (VIRUSTOTAL_API_KEY or None)
     cache_path = Path(args.vt_cache or VT_CACHE_FILE)
 
-    try:
-        records = _resolve_snapshot_records(args.snapshot, snapshots_dir, required=False)
-        vt_checked, vt_flagged = audit_drive_records(records, api_key=api_key, cache_path=cache_path)
+    records = _resolve_snapshot_records(args.snapshot, snapshots_dir, required=False)
+    vt_checked, vt_flagged = audit_drive_records(records, api_key=api_key, cache_path=cache_path)
 
-        roots = list(args.paths) if args.paths else discover_workspace_content_dirs(WORKSPACE_DIR)
-        local_audits = audit_local_pdfs(roots, api_key=api_key, cache_path=cache_path)
-    except (DoctreeBoundaryError, OSError, UnicodeError, json.JSONDecodeError) as error:
-        return _render_boundary_error(error, default_boundary=BoundaryKind.FILESYSTEM)
+    roots = list(args.paths) if args.paths else discover_workspace_content_dirs(WORKSPACE_DIR)
+    local_audits = audit_local_pdfs(roots, api_key=api_key, cache_path=cache_path)
     local_flagged = [a for a in local_audits if not a.is_safe]
 
     console.print(
@@ -278,15 +298,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
             soft_wrap=True,
         )
     for audit in local_flagged:
-        reasons = []
-        if not audit.valid_pdf_header:
-            reasons.append("PDF 헤더(%PDF-) 누락")
-        if not audit.valid_pdf_eof:
-            reasons.append("PDF 종료(%%EOF) 누락/손상")
-        if audit.dangerous_tags:
-            reasons.append("위험 태그: " + ", ".join(audit.dangerous_tags))
-        if audit.vt_verdict and audit.vt_verdict.status in ("malicious", "suspicious"):
-            reasons.append(f"VT={audit.vt_verdict.status}({audit.vt_verdict.malicious})")
+        reasons = format_local_audit_reasons(audit)
         console.print(
             f"[로컬 PDF 주의] {audit.path} (sha256={audit.sha256[:16]}... · {'; '.join(reasons)})",
             style="yellow",
@@ -299,41 +311,39 @@ def cmd_audit(args: argparse.Namespace) -> int:
     return 0
 
 
+@_boundary_guarded(BoundaryKind.TAXONOMY)
 def cmd_layout(args: argparse.Namespace) -> int:
     """프로젝트 레이아웃 프로필(config/project_layout_profiles.yaml)을 CLI로 조회 및 원자적 수정한다."""
     layout_path = Path(args.file or PROJECT_LAYOUT_PROFILES_FILE)
-    try:
-        if args.layout_action == "get":
-            data = load_layout_profiles(layout_path)
-            value = get_layout_value(data, profile=args.profile, field=args.field)
-            rendered = format_layout_value(value, fmt=args.format)
-            console.print(rendered, markup=False, highlight=False, soft_wrap=True, end="")
-            return 0
-        if args.layout_action == "set":
-            updated_profile = set_layout_field(layout_path, args.profile, args.field, args.values)
-            console.print(
-                f"✅ 레이아웃 프로필 갱신 완료: {args.profile}.{args.field} -> {updated_profile[args.field]}",
-                markup=False,
-                soft_wrap=True,
-            )
-            return 0
-        if args.layout_action == "add":
-            updated_list = add_layout_items(layout_path, args.profile, args.field, args.items)
-            console.print(
-                f"✅ 레이아웃 항목 추가 완료: {args.profile}.{args.field} ({len(updated_list)}개 항목)",
-                markup=False,
-                soft_wrap=True,
-            )
-            return 0
-        updated_list = remove_layout_items(layout_path, args.profile, args.field, args.items)
+    if args.layout_action == "get":
+        data = load_layout_profiles(layout_path)
+        value = get_layout_value(data, profile=args.profile, field=args.field)
+        rendered = format_layout_value(value, fmt=args.format)
+        console.print(rendered, markup=False, highlight=False, soft_wrap=True, end="")
+        return 0
+    if args.layout_action == "set":
+        updated_profile = set_layout_field(layout_path, args.profile, args.field, args.values)
         console.print(
-            f"✅ 레이아웃 항목 제거 완료: {args.profile}.{args.field} ({len(updated_list)}개 항목)",
+            f"✅ 레이아웃 프로필 갱신 완료: {args.profile}.{args.field} -> {updated_profile[args.field]}",
             markup=False,
             soft_wrap=True,
         )
         return 0
-    except (DoctreeBoundaryError, OSError, UnicodeError) as error:
-        return _render_boundary_error(error, default_boundary=BoundaryKind.TAXONOMY)
+    if args.layout_action == "add":
+        updated_list = add_layout_items(layout_path, args.profile, args.field, args.items)
+        console.print(
+            f"✅ 레이아웃 항목 추가 완료: {args.profile}.{args.field} ({len(updated_list)}개 항목)",
+            markup=False,
+            soft_wrap=True,
+        )
+        return 0
+    updated_list = remove_layout_items(layout_path, args.profile, args.field, args.items)
+    console.print(
+        f"✅ 레이아웃 항목 제거 완료: {args.profile}.{args.field} ({len(updated_list)}개 항목)",
+        markup=False,
+        soft_wrap=True,
+    )
+    return 0
 
 
 def _resolve_cache_file(args: argparse.Namespace, snapshots_dir: Path) -> Path:
@@ -346,169 +356,239 @@ def _resolve_cache_file(args: argparse.Namespace, snapshots_dir: Path) -> Path:
     return Path(LOCAL_CONTENTS_CACHE_FILE)
 
 
+@_boundary_guarded(BoundaryKind.FILESYSTEM)
 def cmd_sync(args: argparse.Namespace) -> int:
     """Step 1: 드라이브 스냅샷(SHA-256)과 로컬 워크스페이스 contents/(SHA-256)의 3-Way 정합성을 판별한다."""
     snapshots_dir = Path(args.snapshots_dir or SNAPSHOTS_DIR)
     ws_dir = Path(args.workspace_dir or WORKSPACE_DIR)
     cache_file = _resolve_cache_file(args, snapshots_dir)
-    try:
-        records = _resolve_snapshot_records(args.snapshot, snapshots_dir)
-        local_entries, hits, recomp = scan_workspace_contents(ws_dir, cache_path=cache_file)
-        comparison = compare_drive_and_local(
-            records,
-            local_entries,
-            cache_hits=hits,
-            recomputed=recomp,
-        )
-        report = format_sync_report(comparison, len(records), len(local_entries))
-        console.print(report, markup=False, highlight=False, soft_wrap=True, end="")
-        return 0
-    except (DoctreeBoundaryError, OSError, UnicodeError, json.JSONDecodeError) as error:
-        return _render_boundary_error(error, default_boundary=BoundaryKind.FILESYSTEM)
+    records = _resolve_snapshot_records(args.snapshot, snapshots_dir)
+    local_entries, hits, recomp = scan_workspace_contents(ws_dir, cache_path=cache_file)
+    comparison = compare_drive_and_local(
+        records,
+        local_entries,
+        cache_hits=hits,
+        recomputed=recomp,
+    )
+    report = format_sync_report(comparison, len(records), len(local_entries))
+    console.print(report, markup=False, highlight=False, soft_wrap=True, end="")
+    return 0
 
 
+@_boundary_guarded(BoundaryKind.FILESYSTEM)
 def cmd_pull(args: argparse.Namespace) -> int:
-    """Step 1: 드라이브 스냅샷에서 도서를 찾아 특정 로컬 프로젝트의 contents/ 폴더로 내려받는다."""
+    """Step 1: 드라이브 스냅샷에서 도서를 찾아 특정 로컬 프로젝트의 contents/(및 하위 경로) 폴더로 내려받는다."""
     snapshots_dir = Path(args.snapshots_dir or SNAPSHOTS_DIR)
     ws_dir = Path(args.workspace_dir or WORKSPACE_DIR)
     cache_file = _resolve_cache_file(args, snapshots_dir)
-    try:
-        records = _resolve_snapshot_records(args.snapshot, snapshots_dir)
-        drive = build_drive()
-        if not drive.service:
-            raise DriveAuthError(AUTH_MISSING_MESSAGE)
-        rec, dest_path = pull_drive_pdf_to_project(
-            drive,
-            records,
-            args.query,
-            args.project,
-            workspace_dir=ws_dir,
-            output_name=args.output_name,
-            cache_path=cache_file,
-        )
-        sha_preview = str(rec.get("sha256") or "")[:16]
-        console.print(
-            f"📥 도서 가져오기 완료: {rec['name']} ➔ {dest_path} (sha256={sha_preview}...)",
-            markup=False,
-            soft_wrap=True,
-        )
-        return 0
-    except (DoctreeBoundaryError, OSError, UnicodeError, json.JSONDecodeError) as error:
-        return _render_boundary_error(error, default_boundary=BoundaryKind.FILESYSTEM)
+    records = _resolve_snapshot_records(args.snapshot, snapshots_dir)
+    drive = build_drive()
+    if not drive.service:
+        raise DriveAuthError(AUTH_MISSING_MESSAGE)
+    rec, dest_path = pull_drive_pdf_to_project(
+        drive,
+        records,
+        args.query,
+        args.project,
+        workspace_dir=ws_dir,
+        subdir=args.subdir,
+        output_name=args.output_name,
+        cache_path=cache_file,
+    )
+    sha_preview = str(rec.get("sha256") or "")[:16]
+    console.print(
+        f"📥 도서 가져오기 완료: {rec['name']} ➔ {dest_path} (sha256={sha_preview}...)",
+        markup=False,
+        soft_wrap=True,
+    )
+    return 0
 
 
+@_boundary_guarded(BoundaryKind.TAXONOMY)
 def cmd_scaffold(args: argparse.Namespace) -> int:
-    """Step 2: 로컬 프로젝트를 지정한 레이아웃 프로필(handcrafted/research/toolchain) 구조로 강제 생성 및 보정한다."""
+    """Step 2: 로컬 프로젝트를 지정한 레이아웃 프로필(handcrafted/toolchain) 구조로 강제 생성 및 보정한다."""
     layout_path = Path(args.file or PROJECT_LAYOUT_PROFILES_FILE)
-    try:
-        if args.check:
-            ok, missing = verify_project_scaffold(
-                args.profile,
-                args.path,
-                layout_file=layout_path,
-            )
-            if not ok:
-                raise ClassificationError(
-                    f"{args.path} 레이아웃 누락 항목 ({len(missing)}개): {', '.join(missing)}"
-                )
-            console.print(
-                f"✅ 프로젝트 레이아웃 검증 통과: {Path(args.path).resolve()} (프로필: {args.profile})",
-                markup=False,
-                soft_wrap=True,
-            )
-            return 0
-
-        res = scaffold_project(
+    if args.check:
+        ok, missing = verify_project_scaffold(
             args.profile,
             args.path,
             layout_file=layout_path,
-            overwrite=args.overwrite,
         )
+        if not ok:
+            raise ClassificationError(
+                f"{args.path} 레이아웃 누락 항목 ({len(missing)}개): {', '.join(missing)}"
+            )
         console.print(
-            f"🏗️ 프로젝트 스캐폴딩 완료: {res.target_dir} (프로필: {res.profile} · "
-            f"생성 폴더 {len(res.created_dirs)}개 · 생성 파일 {len(res.created_files)}개 · 보존 파일 {len(res.preserved_files)}개)",
+            f"✅ 프로젝트 레이아웃 검증 통과: {Path(args.path).resolve()} (프로필: {args.profile})",
             markup=False,
             soft_wrap=True,
         )
         return 0
-    except (DoctreeBoundaryError, OSError, UnicodeError) as error:
-        return _render_boundary_error(error, default_boundary=BoundaryKind.TAXONOMY)
+
+    res = scaffold_project(
+        args.profile,
+        args.path,
+        layout_file=layout_path,
+        overwrite=args.overwrite,
+    )
+    console.print(
+        f"🏗️ 프로젝트 스캐폴딩 완료: {res.target_dir} (프로필: {res.profile} · "
+        f"생성 폴더 {len(res.created_dirs)}개 · 생성 파일 {len(res.created_files)}개 · 보존 파일 {len(res.preserved_files)}개)",
+        markup=False,
+        soft_wrap=True,
+    )
+    return 0
 
 
+def _discover_parse_targets(target: Path) -> list[Path]:
+    if target.is_file():
+        return [target]
+    search_root = target / "contents" if (target / "contents").is_dir() else target
+    pdfs = discover_local_pdfs([search_root])
+    if not pdfs:
+        raise ClassificationError(f"파싱할 PDF 파일을 찾을 수 없습니다: {target}")
+    return pdfs
+
+
+@_boundary_guarded(BoundaryKind.TAXONOMY)
 def cmd_parse(args: argparse.Namespace) -> int:
     """Step 3: PDF를 페이지별 마크다운·크롭 PNG·Graphviz DOT SVG로 파싱하고 원본 동일성을 검증한다."""
-    try:
-        target = Path(args.target)
-        if target.is_file():
-            pdfs = [target]
-        else:
-            search_root = target / "contents" if (target / "contents").is_dir() else target
-            pdfs = discover_local_pdfs([search_root])
-        if not pdfs:
-            raise ClassificationError(f"파싱할 PDF 파일을 찾을 수 없습니다: {target}")
-
-        has_warnings = False
-        for pdf_path in pdfs:
-            res = parse_pdf_to_content_data(
-                pdf_path,
-                output_dir=args.output_dir,
-                verify=args.verify or args.strict,
-                dot_bin=args.dot_bin,
-            )
-            if res.warned_pages > 0:
-                has_warnings = True
-            console.print(
-                f"📄 PDF 파싱 완료: {res.content_name} (총 {res.total_pages}페이지 · "
-                f"PASS {res.passed_pages} · WARN {res.warned_pages} ➔ {res.index_json_path})",
-                markup=False,
-                soft_wrap=True,
-            )
-        if args.strict and has_warnings:
-            return 1
-        return 0
-    except (DoctreeBoundaryError, OSError, UnicodeError, json.JSONDecodeError) as error:
-        return _render_boundary_error(error, default_boundary=BoundaryKind.TAXONOMY)
+    pdfs = _discover_parse_targets(Path(args.target))
+    has_warnings = False
+    for pdf_path in pdfs:
+        res = parse_pdf_to_content_data(
+            pdf_path,
+            output_dir=args.output_dir,
+            verify=args.verify or args.strict,
+            dot_bin=args.dot_bin,
+        )
+        if res.warned_pages > 0:
+            has_warnings = True
+        console.print(
+            f"📄 PDF 파싱 완료: {res.content_name} (총 {res.total_pages}페이지 · "
+            f"PASS {res.passed_pages} · WARN {res.warned_pages} ➔ {res.index_json_path})",
+            markup=False,
+            soft_wrap=True,
+        )
+    if args.strict and has_warnings:
+        return 1
+    return 0
 
 
+def _discover_practice_content_dirs(target: Path) -> list[Path]:
+    if (target / "index.json").is_file():
+        return [target]
+    base = target / "content_data" if (target / "content_data").is_dir() else target
+    return sorted(idx.parent for idx in base.rglob("index.json")) if base.is_dir() else []
+
+
+def _run_practice_generation(args: argparse.Namespace) -> None:
+    target = Path(args.target)
+    content_dirs = _discover_practice_content_dirs(target)
+    for cdir in content_dirs:
+        res = build_practice_katas(
+            cdir,
+            practice_root=args.practice_dir,
+            lang=args.lang,
+            overwrite=args.overwrite,
+            dot_bin=args.dot_bin,
+        )
+        console.print(
+            f"🎯 실습(Kata) 생성 완료: {res.content_name} (장 {res.chapters_count}개 · "
+            f"과제 {res.katas_count}개 · 언어 .{res.lang_ext} ➔ {res.practice_content_dir})",
+            markup=False,
+            soft_wrap=True,
+        )
+    practice_target = Path(args.practice_dir) if args.practice_dir else target
+    backfilled = backfill_practice_pitfalls(
+        practice_target,
+        lang=args.lang,
+        overwrite=args.overwrite,
+    )
+    if backfilled:
+        console.print(
+            f"🛠️ 기존 실습(Kata) PITFALLS.md 보강 완료: {len(backfilled)}개 절 폴더 ({practice_target.resolve()})",
+            markup=False,
+            soft_wrap=True,
+        )
+    if not content_dirs and not backfilled:
+        raise ClassificationError(
+            f"실습을 생성할 content_data 도서 디렉터리(index.json 포함)를 찾을 수 없습니다: {target}"
+        )
+
+
+@_boundary_guarded(BoundaryKind.TAXONOMY)
 def cmd_practice(args: argparse.Namespace) -> int:
-    """Step 4: content_data/<도서명>/ 중간 결과물을 조합해 practice/<도서명>/<장>/<절>/ 실습 코드를 생성한다."""
-    try:
-        target = Path(args.target)
-        content_dirs: list[Path] = []
-        if (target / "index.json").is_file():
-            content_dirs = [target]
-        else:
-            base = target / "content_data" if (target / "content_data").is_dir() else target
-            if base.is_dir():
-                content_dirs = sorted(
-                    d for d in base.iterdir() if d.is_dir() and (d / "index.json").is_file()
-                )
-        if not content_dirs:
+    """Step 4: content_data/<도서명>/ 중간 결과물을 조합해 practice/<도서명>/<장>/<절>/ 실습 코드를 생성하거나 검증(--check)한다."""
+    if args.check:
+        check_target = Path(args.practice_dir) if args.practice_dir else Path(args.target)
+        ok, missing = verify_practice_katas(check_target)
+        if not ok:
             raise ClassificationError(
-                f"실습을 생성할 content_data 도서 디렉터리(index.json 포함)를 찾을 수 없습니다: {target}"
+                f"{check_target} 실습(Kata) 4대 표준 파일 누락 항목 ({len(missing)}개): {', '.join(missing)}"
             )
-
-        for cdir in content_dirs:
-            res = build_practice_katas(
-                cdir,
-                practice_root=args.practice_dir,
-                lang=args.lang,
-                overwrite=args.overwrite,
-                dot_bin=args.dot_bin,
-            )
-            console.print(
-                f"🎯 실습(Kata) 생성 완료: {res.content_name} (장 {res.chapters_count}개 · "
-                f"과제 {res.katas_count}개 · 언어 .{res.lang_ext} ➔ {res.practice_content_dir})",
-                markup=False,
-                soft_wrap=True,
-            )
+        console.print(
+            f"✅ 실습(Kata) 4대 표준 파일 검증 통과: {check_target.resolve()}",
+            markup=False,
+            soft_wrap=True,
+        )
         return 0
-    except (DoctreeBoundaryError, OSError, UnicodeError, json.JSONDecodeError) as error:
-        return _render_boundary_error(error, default_boundary=BoundaryKind.TAXONOMY)
+
+    _run_practice_generation(args)
+    return 0
+
+
+@_boundary_guarded(BoundaryKind.TAXONOMY)
+def cmd_snippet(args: argparse.Namespace) -> int:
+    """실습 코드(practice/) 내 [[snippet]] / @snippet 추출, 인간 검증(--verify) 및 마크다운·블로그 내보내기를 수행한다."""
+    project_dir = Path(args.path).resolve()
+    today_str = now_kst().strftime("%Y-%m-%d")
+    acted = False
+
+    if args.verify:
+        verified = verify_snippet(
+            project_dir,
+            args.verify,
+            reviewer=args.reviewer,
+            verified_at=today_str,
+        )
+        console.print(
+            f"✅ 스니펫 인간 검증 완료 ({len(verified)}건, reviewer={args.reviewer}): "
+            + ", ".join(r.symbol for r in verified),
+            markup=False,
+            soft_wrap=True,
+        )
+        acted = True
+
+    if args.export is not None:
+        out_md = export_snippets_markdown(project_dir, args.export or None)
+        console.print(f"📝 스니펫 마크다운 대시보드 내보내기 완료: {out_md}", markup=False, soft_wrap=True)
+        acted = True
+
+    if args.export_blog is not None:
+        posts = export_snippets_blog_posts(
+            project_dir,
+            args.export_blog or None,
+            date_prefix=today_str,
+        )
+        console.print(
+            f"📰 기술 블로그 포스트 내보내기 완료 ({len(posts)}건): {posts[0].parent}",
+            markup=False,
+            soft_wrap=True,
+        )
+        acted = True
+
+    if not acted or args.list or args.status:
+        records = sync_snippet_registry(project_dir)
+        report = format_snippets_report(records, query=args.query)
+        console.print(report, markup=False, highlight=False, soft_wrap=True, end="")
+    return 0
 
 
 class DoctreeHelpFormatter(argparse.RawDescriptionHelpFormatter):
     """한글 명령어·옵션 설명이 줄바꿈으로 잘리지 않도록 정렬 폭을 넓힌 도움말 포매터."""
+
+    __slots__ = ()
 
     def __init__(self, prog: str) -> None:
         super().__init__(prog, max_help_position=34, width=108)
@@ -592,22 +672,9 @@ def cmd_help(args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="doctree",
-        description=_ROOT_DESCRIPTION,
-        epilog=_ROOT_EPILOG,
-        formatter_class=DoctreeHelpFormatter,
-    )
-    parser.add_argument(
-        "-V",
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
-        help="설치된 doctree 버전 출력",
-    )
-    subparsers = parser.add_subparsers(dest="command", metavar="<command>", required=True)
-
+def _register_core_subparsers(
+    subparsers: argparse._SubParsersAction,
+) -> dict[tuple[str, ...], argparse.ArgumentParser]:
     p_help = subparsers.add_parser(
         "help",
         help="전체 워크플로 요약 또는 특정 서브커맨드의 상세 도움말 출력",
@@ -748,11 +815,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--strict", action="store_true", help="위협/손상 파일 발견 시 종료 코드 1 반환")
     p_audit.set_defaults(func=cmd_audit)
 
+    return {
+        ("help",): p_help,
+        ("auth",): p_auth,
+        ("status",): p_status,
+        ("classify",): p_classify,
+        ("update",): p_update,
+        ("audit",): p_audit,
+    }
+
+
+def _register_layout_subparsers(
+    subparsers: argparse._SubParsersAction,
+) -> dict[tuple[str, ...], argparse.ArgumentParser]:
     p_layout = subparsers.add_parser(
         "layout",
         help="프로젝트 레이아웃 프로필(config/project_layout_profiles.yaml) 조회 및 원자적 수정",
         description=(
-            "프로젝트 유형별(handcrafted, research, toolchain) 표준 디렉터리·필수 파일·gitignore 구조 규격이 정의된\n"
+            "프로젝트 유형별(handcrafted, toolchain) 표준 디렉터리·필수 파일·gitignore 구조 규격이 정의된\n"
             "config/project_layout_profiles.yaml을 CLI로 조회(get)하거나 원자적으로 수정(set/add/remove)합니다."
         ),
         epilog=(
@@ -760,8 +840,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  doctree layout get                                   # 전체 프로필 YAML 출력\n"
             "  doctree layout get handcrafted directories --format lines\n"
             "  doctree layout set handcrafted practice_dir practice\n"
-            "  doctree layout add research directories benchmarks\n"
-            "  doctree layout remove research directories benchmarks"
+            "  doctree layout add handcrafted directories benchmarks\n"
+            "  doctree layout remove handcrafted directories benchmarks"
         ),
         formatter_class=DoctreeHelpFormatter,
     )
@@ -779,7 +859,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=DoctreeHelpFormatter,
     )
-    p_layout_get.add_argument("profile", nargs="?", default=None, help="조회할 프로필 이름 (예: handcrafted, research, toolchain)")
+    p_layout_get.add_argument("profile", nargs="?", default=None, help="조회할 프로필 이름 (예: handcrafted, toolchain)")
     p_layout_get.add_argument("field", nargs="?", default=None, help="조회할 필드 이름 (예: directories, required_files, content_dir)")
     p_layout_get.add_argument(
         "--format",
@@ -829,6 +909,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_layout_remove.add_argument("--file", type=Path, default=None, help="대상 레이아웃 YAML 경로")
     p_layout_remove.set_defaults(func=cmd_layout)
 
+    return {
+        ("layout",): p_layout,
+        ("layout", "get"): p_layout_get,
+        ("layout", "set"): p_layout_set,
+        ("layout", "add"): p_layout_add,
+        ("layout", "remove"): p_layout_remove,
+    }
+
+
+def _register_pipeline_subparsers(
+    subparsers: argparse._SubParsersAction,
+) -> dict[tuple[str, ...], argparse.ArgumentParser]:
     p_sync = subparsers.add_parser(
         "sync",
         help="드라이브 스냅샷(SHA-256) ⟷ 로컬 프로젝트 contents/(SHA-256) 3-Way 동기화 비교",
@@ -854,17 +946,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="드라이브의 원하는 PDF를 특정 로컬 프로젝트의 contents/로 내려받기",
         description=(
             "[Step 1] 드라이브 스냅샷에서 파일 ID, SHA-256 해시 또는 제목 키워드로 도서를 찾아\n"
-            "지정한 로컬 프로젝트의 contents/ 폴더로 내려받고 SHA-256 무결성을 검증합니다."
+            "지정한 로컬 프로젝트의 contents/(또는 <트랙>/<도서_슬러그> 하위 경로)로 내려받고 SHA-256 무결성을 검증합니다."
         ),
         epilog=(
             "사용 예시:\n"
             "  doctree pull \"친절한 SQL 튜닝\" databases\n"
-            "  doctree pull 1w8BcxnWcJtOHEbklCQa16MmJnG3i46Uv databases --output-name sql-tuning.pdf"
+            "  doctree pull \"토비의 스프링\" handcrafted-java/spring/01_toby_spring\n"
+            "  doctree pull 1w8BcxnWcJtOHEbklCQa16MmJnG3i46Uv databases --subdir tuning --output-name sql-tuning.pdf"
         ),
         formatter_class=DoctreeHelpFormatter,
     )
     p_pull.add_argument("query", help="내려받을 도서의 Drive 파일 ID, SHA-256 해시 또는 도서명 키워드")
-    p_pull.add_argument("project", help="배치할 로컬 프로젝트 폴더명 (예: databases, handcrafted-cpp)")
+    p_pull.add_argument("project", help="배치할 로컬 프로젝트 또는 <프로젝트>/<트랙>/<도서_슬러그> 경로")
+    p_pull.add_argument("--subdir", default=None, help="contents/ 아래 배치할 하위 디렉터리 경로 (예: <트랙>/<도서_슬러그>)")
     p_pull.add_argument("--output-name", default=None, help="저장할 파일명 (생략 시 드라이브 원본 파일명)")
     p_pull.add_argument("--snapshot", type=Path, default=None, help="참조할 스냅샷 JSON 경로 (생략 시 최신 스냅샷)")
     p_pull.add_argument("--snapshots-dir", type=Path, default=None, help="스냅샷 디렉터리")
@@ -917,14 +1011,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_practice = subparsers.add_parser(
         "practice",
-        help="중간 결과물(content_data/)을 장·절별로 묶어 실습·테스트 프레임워크(practice/) 생성",
+        help="중간 결과물(content_data/)을 장·절별로 묶어 실습·테스트 프레임워크(practice/) 생성 및 검증",
         description=(
-            "[Step 4] 파싱된 content_data/<도서명>/ 중간 결과물을 장·절 단위로 조합하여\n"
-            "practice/<도서명>/<장>/<절>/ 아래에 README.md, main.<ext>, test.<ext> 실습(Kata) 패키지를 생성합니다."
+            "[Step 4] 파싱된 content_data/ 중간 결과물을 장·절 단위로 조합하여\n"
+            "practice/<트랙_또는_분류>/<도서_슬러그>/<장>/<절>/ 아래에 README.md, PITFALLS.md, main.<ext>, test.<ext> 4대 표준 실습(Kata) 패키지를 생성하거나 검증(--check)합니다."
         ),
         epilog=(
             "사용 예시:\n"
             "  doctree practice ../databases                        # 프로젝트 내 전체 도서 실습 패키지 생성\n"
+            "  doctree practice ../databases --check                # 4대 표준 실습 파일 존재 여부 검증\n"
             "  doctree practice ../databases/content_data/친절한-SQL-튜닝 --lang sql --overwrite"
         ),
         formatter_class=DoctreeHelpFormatter,
@@ -933,30 +1028,75 @@ def build_parser() -> argparse.ArgumentParser:
     p_practice.add_argument("--practice-dir", type=Path, default=None, help="실습 코드 루트 디렉토리 (기본: <프로젝트>/practice)")
     p_practice.add_argument("--lang", default=None, help="실습 코드 언어 강제 지정 (py | cpp | java | sql)")
     p_practice.add_argument("--overwrite", action="store_true", help="기존 실습 파일도 다시 생성하여 덮어쓰기")
+    p_practice.add_argument("--check", action="store_true", help="파일을 생성하지 않고 4대 표준 실습 파일(README.md, PITFALLS.md, main.*, test.*) 충족 여부만 검증")
     p_practice.add_argument("--dot-bin", default="dot", help="Graphviz dot 실행 파일 경로 (기본: dot)")
     p_practice.set_defaults(func=cmd_practice)
 
-    topic_parsers: dict[tuple[str, ...], argparse.ArgumentParser] = {
-        (): parser,
-        ("help",): p_help,
-        ("auth",): p_auth,
-        ("status",): p_status,
-        ("classify",): p_classify,
-        ("update",): p_update,
-        ("audit",): p_audit,
-        ("layout",): p_layout,
-        ("layout", "get"): p_layout_get,
-        ("layout", "set"): p_layout_set,
-        ("layout", "add"): p_layout_add,
-        ("layout", "remove"): p_layout_remove,
+    return {
         ("sync",): p_sync,
         ("pull",): p_pull,
         ("scaffold",): p_scaffold,
         ("parse",): p_parse,
         ("practice",): p_practice,
     }
-    p_help.set_defaults(func=cmd_help, topic_parsers=topic_parsers)
 
+
+def _register_snippet_subparser(
+    subparsers: argparse._SubParsersAction,
+) -> dict[tuple[str, ...], argparse.ArgumentParser]:
+    p_snippet = subparsers.add_parser(
+        "snippet",
+        help="실습 코드(practice/) 내 [[snippet]] / @snippet 추출, SHA-256 인간 검증 및 블로그 내보내기",
+        description=(
+            "practice/ 하위 소스 코드(.py, .cpp, .cc, .c, .h, .hpp, .java, .sql)에서\n"
+            "C++17 [[snippet]] / [[snippet(\"설명\")]] 및 @snippet / @snippet(\"설명\") 블록을 추출하고,\n"
+            "SHA-256 해시 기반 인간 검증 레지스트리(tips/snippets_registry.json) 관리, 마크다운 대시보드(tips/snippets.md),\n"
+            "및 기술 블로그 포스트(tips/posts/YYYY-MM-DD-<slug>.md) 내보내기를 수행합니다."
+        ),
+        epilog=(
+            "사용 예시:\n"
+            "  doctree snippet --path ../handcrafted-cpp --list\n"
+            "  doctree snippet --path ../handcrafted-cpp --verify solve_kata --reviewer flynn\n"
+            "  doctree snippet --path ../handcrafted-cpp --export\n"
+            "  doctree snippet --path ../handcrafted-cpp --export-blog"
+        ),
+        formatter_class=DoctreeHelpFormatter,
+    )
+    p_snippet.add_argument("query", nargs="?", default=None, help="검색할 심볼·설명·파일명·코드 키워드")
+    p_snippet.add_argument("--path", type=Path, default=Path("."), help="대상 프로젝트 또는 practice/ 디렉토리 경로 (기본: 현재 폴더)")
+    p_snippet.add_argument("--list", action="store_true", help="추출된 전체 스니펫 목록 출력")
+    p_snippet.add_argument("--status", action="store_true", help="스니펫 인간 검증 상태(VERIFIED / PENDING_REVIEW / OUTDATED) 요약 출력")
+    p_snippet.add_argument("--verify", default=None, metavar="SYMBOL", help="지정한 심볼 또는 설명의 스니펫을 VERIFIED 상태로 승인")
+    p_snippet.add_argument("--reviewer", default="human", help="--verify 승인 시 기록할 검토자 이름 (기본: human)")
+    p_snippet.add_argument("--export", nargs="?", const="", default=None, metavar="OUT_PATH", help="스니펫 마크다운 대시보드 내보내기 (기본: <프로젝트>/tips/snippets.md)")
+    p_snippet.add_argument("--export-blog", nargs="?", const="", default=None, metavar="POSTS_DIR", help="기술 블로그 포스트 마크다운 내보내기 (기본: <프로젝트>/tips/posts/)")
+    p_snippet.set_defaults(func=cmd_snippet)
+    return {("snippet",): p_snippet}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="doctree",
+        description=_ROOT_DESCRIPTION,
+        epilog=_ROOT_EPILOG,
+        formatter_class=DoctreeHelpFormatter,
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="설치된 doctree 버전 출력",
+    )
+    subparsers = parser.add_subparsers(dest="command", metavar="<command>", required=True)
+
+    topic_parsers: dict[tuple[str, ...], argparse.ArgumentParser] = {(): parser}
+    topic_parsers.update(_register_core_subparsers(subparsers))
+    topic_parsers.update(_register_layout_subparsers(subparsers))
+    topic_parsers.update(_register_pipeline_subparsers(subparsers))
+    topic_parsers.update(_register_snippet_subparser(subparsers))
+
+    topic_parsers[("help",)].set_defaults(func=cmd_help, topic_parsers=topic_parsers)
     return parser
 
 

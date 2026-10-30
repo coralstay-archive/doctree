@@ -5,36 +5,54 @@ from rich.console import Console
 from rich.table import Table
 
 from doctree.content_taxonomy.category_classifier import ClassificationResult, ClassifiedContent
-from doctree.runtime_env.workspace_settings import normalize_nfc
+from doctree.pdf_threat_audit.pdf_byte_inspector import LocalPdfAudit
+from doctree.runtime_env.workspace_settings import format_record_path, normalize_nfc
 
 __all__ = [
     "console",
     "format_classification_summary",
+    "format_local_audit_reasons",
     "print_account_dashboard",
 ]
 
 console = Console()
 
 
+def format_local_audit_reasons(audit: LocalPdfAudit) -> list[str]:
+    """로컬 PDF 점검 결과에서 비정상·주의 사유 문자열 목록을 생성한다."""
+    reasons: list[str] = []
+    if not audit.valid_pdf_header:
+        reasons.append("PDF 헤더(%PDF-) 누락")
+    if not audit.valid_pdf_eof:
+        reasons.append("PDF 종료(%%EOF) 누락/손상")
+    if audit.dangerous_tags:
+        reasons.append("위험 태그: " + ", ".join(audit.dangerous_tags))
+    vt = audit.vt_verdict
+    if vt and (vt.status in ("malicious", "suspicious") or vt.malicious > 0 or vt.suspicious > 0):
+        count = vt.malicious if vt.malicious > 0 else vt.suspicious
+        reasons.append(f"VT={vt.status}({count})")
+    return reasons
+
+
 def _single_line(value: str) -> str:
-    value = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in value)
-    return " ".join(value.split())
+    cleaned = "".join(" " if not char.isprintable() else char for char in normalize_nfc(value))
+    return " ".join(cleaned.split())
 
 
-def _content_key(content: ClassifiedContent) -> tuple:
+def _content_key(content: ClassifiedContent) -> tuple[str, str]:
     return (normalize_nfc(content.record["name"]).casefold(), content.record["id"])
 
 
-def _source_path(content: ClassifiedContent) -> str:
-    record = content.record
-    folder_path = record.get("folder_path")
-    if isinstance(folder_path, str) and folder_path:
-        return folder_path.rstrip("/") + "/" + record["name"]
-    return record["name"]
+def _tree_branch(is_last: bool) -> str:
+    return "└── " if is_last else "├── "
 
 
-def format_classification_summary(result: ClassificationResult) -> str:
-    """고정 분류 트리 순서(빈 세부분야 포함)와 미분류 검토 목록을 터미널 출력용 텍스트로 만든다."""
+def _tree_indent(is_last: bool) -> str:
+    return "    " if is_last else "│   "
+
+
+def _group_classified_contents(result: ClassificationResult) -> dict[str, list[ClassifiedContent]]:
+    """분류 카탈로그의 세부분야 ID별로 분류된 콘텐츠 목록을 그룹화한다."""
     grouped: dict[str, list[ClassifiedContent]] = {
         subcategory.id: []
         for category in result.catalog.categories
@@ -45,6 +63,12 @@ def format_classification_summary(result: ClassificationResult) -> str:
             if content.category_id not in grouped:
                 raise ValueError("분류표에 없는 세부분야 ID: " + content.category_id)
             grouped[content.category_id].append(content)
+    return grouped
+
+
+def format_classification_summary(result: ClassificationResult) -> str:
+    """고정 분류 트리 순서(빈 세부분야 포함)와 미분류 검토 목록을 터미널 출력용 텍스트로 만든다."""
+    grouped = _group_classified_contents(result)
 
     unclassified = result.unclassified
     lines = [
@@ -55,34 +79,30 @@ def format_classification_summary(result: ClassificationResult) -> str:
     categories = result.catalog.categories
     for category_number, category in enumerate(categories, start=1):
         category_last = category_number == len(categories)
-        lines.append(
-            ("└── " if category_last else "├── ")
-            + f"{category_number}. {_single_line(category.name)}"
-        )
-        category_prefix = "    " if category_last else "│   "
+        lines.append(f"{_tree_branch(category_last)}{category_number}. {_single_line(category.name)}")
+        category_prefix = _tree_indent(category_last)
         for subcategory_number, subcategory in enumerate(category.subcategories, start=1):
             subcategory_last = subcategory_number == len(category.subcategories)
             contents = sorted(grouped[subcategory.id], key=_content_key)
             lines.append(
-                category_prefix
-                + ("└── " if subcategory_last else "├── ")
-                + f"{_single_line(subcategory.name)} ({len(contents)})"
+                f"{category_prefix}{_tree_branch(subcategory_last)}"
+                f"{_single_line(subcategory.name)} ({len(contents)})"
             )
-            content_prefix = category_prefix + ("    " if subcategory_last else "│   ")
+            content_prefix = category_prefix + _tree_indent(subcategory_last)
             for content_number, content in enumerate(contents, start=1):
+                content_last = content_number == len(contents)
                 lines.append(
-                    content_prefix
-                    + ("└── " if content_number == len(contents) else "├── ")
-                    + _single_line(content.record["name"])
+                    f"{content_prefix}{_tree_branch(content_last)}"
+                    f"{_single_line(content.record['name'])}"
                 )
 
     lines.extend(["", "[미분류·검토 대기]"])
     if unclassified:
-        for content in sorted(unclassified, key=_content_key):
-            lines.append(
-                f"- {_single_line(content.record['name'])} "
-                f"(id={_single_line(content.record['id'])}, path={_single_line(_source_path(content))})"
-            )
+        lines.extend(
+            f"- {_single_line(content.record['name'])} "
+            f"(id={_single_line(content.record['id'])}, path={_single_line(format_record_path(content.record))})"
+            for content in sorted(unclassified, key=_content_key)
+        )
     else:
         lines.append("미분류 콘텐츠가 없습니다.")
     return "\n".join(lines) + "\n"
@@ -106,7 +126,8 @@ def print_account_dashboard(account_info: dict | None):
     usage_percent = account_info.get("usage_percent", 0.0)
 
     if limit_gb:
-        gauge_bar = f"[{'█' * int(usage_percent // 5)}{'░' * (20 - int(usage_percent // 5))}] {usage_percent}%"
+        filled_blocks = min(20, max(0, int(usage_percent // 5)))
+        gauge_bar = f"[{'█' * filled_blocks}{'░' * (20 - filled_blocks)}] {usage_percent}%"
         table.add_row("💾 전체 스토리지", f"{usage_gb} GB / {limit_gb} GB ({gauge_bar})")
     else:
         table.add_row("💾 전체 스토리지 사용량", f"{usage_gb} GB (무제한/기관)")

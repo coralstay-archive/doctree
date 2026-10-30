@@ -17,6 +17,7 @@ dist/
 
 # Test & Coverage Artifacts
 .pytest_cache/
+.hypothesis/
 .coverage
 .coverage.*
 htmlcov/
