@@ -556,3 +556,7 @@ doctree practice <TARGET> [--lang py|cpp|java|sql]         # [Step 4] content_da
 # 3) 시각적 단일 HTML 수행 리포트 생성 (pytest-html)
 .venv/bin/python -m pytest --html=/tmp/doctree_test_report.html --self-contained-html
 ```
+
+## 라이선스
+
+[GNU AGPL-3.0-only](./LICENSE)

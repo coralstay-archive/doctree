@@ -7,6 +7,8 @@ name = "doctree"
 version = "0.1.0"
 description = "구글 드라이브 및 로컬 콘텐츠(contents) PDF 스냅샷·분류·레이아웃 규격·보안 감사 CLI"
 readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [{ name = "flynn", email = "coralstay3595@gmail.com" }]
 requires-python = ">=3.11"
 dependencies = [
