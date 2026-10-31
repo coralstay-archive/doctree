@@ -25,6 +25,7 @@ from doctree.doctree_cli import command_dispatcher as cli
 from doctree.runtime_env.boundary_errors import ClassificationError, SnapshotStorageError
 from doctree.runtime_env.layout_profile_store import (
     LIST_FIELDS,
+    MANDATORY_PROFILE_DIRECTORIES,
     SCALAR_FIELDS,
     _validate_safe_relative_path,
     add_layout_items,
@@ -78,12 +79,29 @@ def test_load_real_project_layout_profiles_and_query_formats():
 
     dirs = get_layout_value(data, profile="handcrafted", field="directories")
     assert format_layout_value(dirs, fmt="lines").splitlines() == [
-        "contents",
         "content_data",
+        "contents",
         "practice",
         "scripts",
         "tips",
+        ".opensource",
     ]
+
+
+def test_handcrafted_mandatory_directories_cannot_be_removed(sample_layout_file: Path):
+    """handcrafted 필수 6개 디렉토리는 CLI로 제거할 수 없고, 사용자 지시에 의한 추가 디렉토리는 허용된다."""
+    before = sample_layout_file.read_text(encoding="utf-8")
+    for mandatory in ("content_data", "contents", "practice", "scripts", "tips", ".opensource"):
+        with pytest.raises(ClassificationError, match="필수 디렉토리는 제거할 수 없습니다"):
+            remove_layout_items(sample_layout_file, "handcrafted", "directories", [mandatory])
+    assert sample_layout_file.read_text(encoding="utf-8") == before
+
+    with pytest.raises(ClassificationError, match="필수 디렉토리는 제거할 수 없습니다"):
+        set_layout_field(sample_layout_file, "handcrafted", "directories", ["contents", "practice"])
+
+    dirs = add_layout_items(sample_layout_file, "handcrafted", "directories", ["benchmarks"])
+    assert dirs[-1] == "benchmarks"
+    remove_layout_items(sample_layout_file, "handcrafted", "directories", ["benchmarks"])
 
 
 def test_set_add_remove_layout_operations_and_nfd_normalization(sample_layout_file: Path):
@@ -284,7 +302,7 @@ def test_layout_validation_schema_errors(tmp_path: Path):
             )
     with pytest.raises(ClassificationError, match="중복 프로필"):
         validate_layout_profiles(
-            {"schema_version": 1, "profiles": {"handcrafted": base_profile, " handcrafted ": base_profile}}
+            {"schema_version": 1, "profiles": {"research": base_profile, " research ": base_profile}}
         )
 
     # 9) load_layout_profiles: 중복 YAML 키 및 파일 없음 오류
@@ -448,7 +466,11 @@ class LayoutProfileStoreStateMachine(RuleBasedStateMachine):
     )
     def rule_remove_or_reject_list_item(self, profile: str, field: str) -> None:
         shadow_list: list[str] = self.shadow["profiles"][profile][field]
-        if len(shadow_list) > 1:
+        mandatory = MANDATORY_PROFILE_DIRECTORIES.get(profile, ()) if field == "directories" else ()
+        if shadow_list[-1] in mandatory:
+            with pytest.raises(ClassificationError, match="필수 디렉토리는 제거할 수 없습니다"):
+                remove_layout_items(self.layout_file, profile, field, [shadow_list[-1]])
+        elif len(shadow_list) > 1:
             victim = shadow_list.pop()
             updated = remove_layout_items(self.layout_file, profile, field, [victim])
             assert updated == shadow_list

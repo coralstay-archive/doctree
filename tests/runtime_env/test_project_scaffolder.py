@@ -33,7 +33,7 @@ def test_scaffold_handcrafted_research_toolchain_and_idempotency(tmp_path: Path)
     # 2) 최초 스캐폴딩 실행
     res1 = scaffold_project("handcrafted", proj)
     assert res1.profile == "handcrafted"
-    assert set(res1.created_dirs) == {"contents", "content_data", "practice", "scripts", "tips"}
+    assert set(res1.created_dirs) == {"content_data", "contents", "practice", "scripts", "tips", ".opensource"}
     assert res1.existing_dirs == ()
     assert ".gitignore" in res1.created_files
     assert "scripts/run.sh" in res1.created_files
@@ -53,7 +53,7 @@ def test_scaffold_handcrafted_research_toolchain_and_idempotency(tmp_path: Path)
 
     res2 = scaffold_project("handcrafted", proj, overwrite=False)
     assert res2.created_dirs == ()
-    assert set(res2.existing_dirs) == {"contents", "content_data", "practice", "scripts", "tips"}
+    assert set(res2.existing_dirs) == {"content_data", "contents", "practice", "scripts", "tips", ".opensource"}
     assert "README.md" in res2.preserved_files
     assert ".gitignore" in res2.preserved_files
     assert readme_path.read_text(encoding="utf-8") == "# Custom Handcrafted Readme\n"
@@ -75,19 +75,40 @@ def test_scaffold_handcrafted_research_toolchain_and_idempotency(tmp_path: Path)
     assert "freeride (`handcrafted` 프로필)" in readme_rendered
     assert "assets/*.{png,svg}" in readme_rendered
     assert "PITFALLS.md" in readme_rendered
-    assert "<트랙_또는_분류>/<도서_슬러그>/<장>/<절>" in readme_rendered
+    assert "<도서명>/<장>/<절>" in readme_rendered and "트랙_또는_분류" not in readme_rendered
     structure_rendered = (proj / "PROJECT_STRUCTURE.md").read_text(encoding="utf-8")
     assert "PITFALLS.md" in structure_rendered
-    assert "practice/<트랙_또는_분류>/<도서_슬러그>/<장>/<절>/" in structure_rendered
+    assert "practice/<도서명>/<장>/<절>/" in structure_rendered
     guide_rendered = (proj / "PRACTICE_GUIDE.md").read_text(encoding="utf-8")
     assert "PITFALLS.md" in guide_rendered
     assert "-maxdepth 4" in (proj / "scripts" / "locate.sh").read_text(encoding="utf-8")
     assert 'exec doctree snippet "$@"' in (proj / "scripts" / "snippets.sh").read_text(encoding="utf-8")
-    assert "practice/<트랙_또는_분류>/<도서_슬러그>/<장>/<절>" in (proj / "scripts" / "help.sh").read_text(encoding="utf-8")
+    assert "practice/<도서명>/<장>/<절>" in (proj / "scripts" / "help.sh").read_text(encoding="utf-8")
 
     # 5) toolchain 프로필 스캐폴딩
     res_toolchain = scaffold_project("toolchain", tmp_path / "toolchain-demo")
     assert "install.sh" in res_toolchain.created_files
+
+
+def test_handcrafted_profile_creates_only_six_dirs_and_leaves_extra_dirs_untouched(tmp_path: Path):
+    """handcrafted 프로필은 6개 최상위 디렉토리만 생성하고, 그 외 기존 디렉토리는 생성·삭제·변경하지 않는다."""
+    proj = tmp_path / "handcrafted-extra"
+    extra_top = proj / "cmake-build-debug"
+    extra_nested = proj / "content_data" / "ml"
+    extra_top.mkdir(parents=True)
+    extra_nested.mkdir(parents=True)
+    (extra_top / "keep.txt").write_text("keep\n", encoding="utf-8")
+
+    res = scaffold_project("handcrafted", proj)
+
+    expected = {"content_data", "contents", "practice", "scripts", "tips", ".opensource"}
+    assert set(res.created_dirs) | set(res.existing_dirs) == expected
+    top_level_dirs = {p.name for p in proj.iterdir() if p.is_dir()}
+    assert top_level_dirs == expected | {"cmake-build-debug"}
+    assert (extra_top / "keep.txt").read_text(encoding="utf-8") == "keep\n"
+    assert extra_nested.is_dir()
+    assert verify_project_scaffold("handcrafted", proj) == (True, ())
+    assert "`.opensource/`" in (proj / "README.md").read_text(encoding="utf-8")
 
 
 def test_ensure_gitignore_entries_edge_cases(tmp_path: Path):

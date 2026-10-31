@@ -421,8 +421,18 @@ def _parse_safe_path_segments(raw_path: str, error_label: str) -> tuple[str, ...
     return parts
 
 
-def _resolve_pull_target_dir(ws: Path, project: str, subdir: str | None = None) -> Path:
-    """대상 프로젝트 경로(<project> 또는 <project>/<트랙>/<슬러그>)와 --subdir로부터 contents/ 하위 대상 폴더를 결정한다."""
+def _resolve_pull_target_dir(
+    ws: Path,
+    project: str,
+    subdir: str | None = None,
+    *,
+    book_dir_name: str | None = None,
+) -> Path:
+    """대상 프로젝트 경로와 --subdir로부터 contents/ 하위 대상 폴더를 결정한다.
+
+    하위 경로(<project>/<경로> 또는 --subdir)를 지정하지 않으면 도서 파일명(확장자 제외)과
+    같은 이름의 디렉토리(contents/<도서명>/)를 대상 폴더로 사용한다.
+    """
     proj_parts = _parse_safe_path_segments(project, "대상 프로젝트 이름")
     project_root = proj_parts[0]
     inline_sub = proj_parts[2:] if len(proj_parts) > 1 and proj_parts[1] == "contents" else proj_parts[1:]
@@ -430,6 +440,8 @@ def _resolve_pull_target_dir(ws: Path, project: str, subdir: str | None = None) 
     if subdir is not None:
         sub_parts = _parse_safe_path_segments(subdir, "하위 경로(subdir)")
         extra_sub = sub_parts[1:] if sub_parts[0] == "contents" else sub_parts
+    if not inline_sub and not extra_sub and book_dir_name:
+        extra_sub = (book_dir_name,)
     return ws.joinpath(project_root, "contents", *inline_sub, *extra_sub)
 
 
@@ -443,13 +455,18 @@ def pull_drive_pdf_to_project(
     subdir: str | None = None,
     **options: Any,
 ) -> tuple[dict, Path]:
-    """스냅샷에서 도서를 찾아 지정한 로컬 프로젝트의 contents/(및 하위 경로) 폴더로 내려받고 해시 캐시를 갱신한다."""
+    """스냅샷에서 도서를 찾아 로컬 프로젝트의 contents/<도서명>/(또는 지정한 하위 경로) 폴더로 내려받고 해시 캐시를 갱신한다."""
     rec = resolve_drive_record_for_pull(records, query)
     ws = Path(workspace_dir).resolve()
-    target_contents_dir = _resolve_pull_target_dir(ws, project, subdir=subdir)
     output_name: str | None = options.get("output_name")
     cache_path: PathLike | None = options.get("cache_path")
     safe_filename = _sanitize_pdf_filename(output_name, rec["name"])
+    target_contents_dir = _resolve_pull_target_dir(
+        ws,
+        project,
+        subdir=subdir,
+        book_dir_name=safe_filename[:-4],
+    )
 
     dest_path = target_contents_dir / safe_filename
     file_id = str(rec["id"])

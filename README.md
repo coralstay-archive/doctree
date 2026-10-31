@@ -282,11 +282,12 @@ profiles:
     content_data_dir: "content_data"
     practice_dir: "practice"
     directories:
-      - "contents"
       - "content_data"
+      - "contents"
       - "practice"
       - "scripts"
       - "tips"
+      - ".opensource"
     required_files:
       - ".gitignore"
       - "README.md"

@@ -243,7 +243,8 @@ def test_resolve_drive_record_and_pull_pdf_to_project(tmp_path: Path):
         output_name="커스텀이름",
         cache_path=cache_file,
     )
-    assert dest == ws / "databases" / "contents" / "커스텀이름.pdf"
+    # 하위 경로 미지정 시 도서 파일명과 같은 디렉토리(contents/<도서명>/)에 배치
+    assert dest == ws / "databases" / "contents" / "커스텀이름" / "커스텀이름.pdf"
     assert dest.read_bytes() == pdf_bytes
     assert cache_file.is_file()
 
@@ -270,6 +271,7 @@ def test_resolve_drive_record_and_pull_pdf_to_project(tmp_path: Path):
         workspace_dir=ws,
         cache_path=None,
     )
+    assert dest2 == ws / "databases" / "contents" / "nosha" / "nosha.pdf"
     assert dest2.is_file()
 
     # 6) Drive 서비스 미활성화, API 예외, SHA-256 불일치 시 DriveListError 검증
@@ -385,7 +387,7 @@ def test_cli_sync_and_pull_commands(tmp_path: Path):
                 == 0
             )
         assert "📥 도서 가져오기 완료:" in buf.getvalue()
-        assert (ws / "handcrafted-cpp" / "contents" / "친절한-SQL-튜닝.pdf").is_file()
+        assert (ws / "handcrafted-cpp" / "contents" / "친절한-SQL-튜닝" / "친절한-SQL-튜닝.pdf").is_file()
 
         unauth_drive = MagicMock(service=None)
         with patch("doctree.doctree_cli.command_dispatcher.build_drive", return_value=unauth_drive):
@@ -552,7 +554,8 @@ class WorkspaceSyncStateMachine(RuleBasedStateMachine):
         )
         assert pulled_rec["sha256"] == sha
         assert dest.read_bytes() == pdf_bytes
-        self.local_files[f"proj-a/contents/book_{doc_idx}.pdf"] = sha
+        assert dest == (self.proj_dir / "contents" / f"book_{doc_idx}" / f"book_{doc_idx}.pdf").resolve()
+        self.local_files[f"proj-a/contents/book_{doc_idx}/book_{doc_idx}.pdf"] = sha
 
     @rule(doc_idx=st.integers(min_value=1, max_value=4))
     def rule_corrupt_pull_preserves_existing_file(self, doc_idx: int) -> None:
@@ -562,7 +565,7 @@ class WorkspaceSyncStateMachine(RuleBasedStateMachine):
             "folder_path": "Books",
             "sha256": "a" * 64,
         }
-        dest = self.proj_dir / "contents" / f"book_{doc_idx}.pdf"
+        dest = self.proj_dir / "contents" / f"book_{doc_idx}" / f"book_{doc_idx}.pdf"
         prior_bytes = dest.read_bytes() if dest.exists() else None
         drive = MagicMock()
         drive.service = MagicMock()
@@ -580,7 +583,7 @@ class WorkspaceSyncStateMachine(RuleBasedStateMachine):
 
     @invariant()
     def invariant_scan_and_3way_sync_consistent(self) -> None:
-        assert not list((self.proj_dir / "contents").glob(".*.tmp"))
+        assert not list((self.proj_dir / "contents").rglob(".*.tmp"))
         entries, _hits, _recomputed = scan_workspace_contents(self.ws_dir, cache_path=self.cache_file)
         assert {e.relative_path: e.sha256 for e in entries} == self.local_files
         comp = compare_drive_and_local(list(self.drive_records.values()), entries)

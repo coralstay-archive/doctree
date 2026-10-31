@@ -946,7 +946,7 @@ def _register_pipeline_subparsers(
         help="드라이브의 원하는 PDF를 특정 로컬 프로젝트의 contents/로 내려받기",
         description=(
             "[Step 1] 드라이브 스냅샷에서 파일 ID, SHA-256 해시 또는 제목 키워드로 도서를 찾아\n"
-            "지정한 로컬 프로젝트의 contents/(또는 <트랙>/<도서_슬러그> 하위 경로)로 내려받고 SHA-256 무결성을 검증합니다."
+            "로컬 프로젝트의 contents/<도서 파일명>/ 디렉토리(하위 경로 미지정 시 자동 생성)로 내려받고 SHA-256 무결성을 검증합니다."
         ),
         epilog=(
             "사용 예시:\n"
@@ -957,8 +957,8 @@ def _register_pipeline_subparsers(
         formatter_class=DoctreeHelpFormatter,
     )
     p_pull.add_argument("query", help="내려받을 도서의 Drive 파일 ID, SHA-256 해시 또는 도서명 키워드")
-    p_pull.add_argument("project", help="배치할 로컬 프로젝트 또는 <프로젝트>/<트랙>/<도서_슬러그> 경로")
-    p_pull.add_argument("--subdir", default=None, help="contents/ 아래 배치할 하위 디렉터리 경로 (예: <트랙>/<도서_슬러그>)")
+    p_pull.add_argument("project", help="배치할 로컬 프로젝트 (contents/<도서 파일명>/ 자동 생성) 또는 <프로젝트>/<하위 경로>")
+    p_pull.add_argument("--subdir", default=None, help="contents/ 아래 배치할 하위 디렉터리 경로 (생략 시 도서 파일명 디렉터리)")
     p_pull.add_argument("--output-name", default=None, help="저장할 파일명 (생략 시 드라이브 원본 파일명)")
     p_pull.add_argument("--snapshot", type=Path, default=None, help="참조할 스냅샷 JSON 경로 (생략 시 최신 스냅샷)")
     p_pull.add_argument("--snapshots-dir", type=Path, default=None, help="스냅샷 디렉터리")
@@ -1014,7 +1014,7 @@ def _register_pipeline_subparsers(
         help="중간 결과물(content_data/)을 장·절별로 묶어 실습·테스트 프레임워크(practice/) 생성 및 검증",
         description=(
             "[Step 4] 파싱된 content_data/ 중간 결과물을 장·절 단위로 조합하여\n"
-            "practice/<트랙_또는_분류>/<도서_슬러그>/<장>/<절>/ 아래에 README.md, PITFALLS.md, main.<ext>, test.<ext> 4대 표준 실습(Kata) 패키지를 생성하거나 검증(--check)합니다."
+            "practice/<도서명>/<장>/<절>/ 아래에 README.md, PITFALLS.md, main.<ext>, test.<ext> 4대 표준 실습(Kata) 패키지를 생성하거나 검증(--check)합니다."
         ),
         epilog=(
             "사용 예시:\n"

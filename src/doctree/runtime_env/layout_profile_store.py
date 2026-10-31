@@ -5,6 +5,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Final
 
 import yaml
@@ -16,6 +17,7 @@ __all__ = [
     "ALL_PROFILE_FIELDS",
     "IDENTIFIER_RE",
     "LIST_FIELDS",
+    "MANDATORY_PROFILE_DIRECTORIES",
     "OUTPUT_FORMATS",
     "REQUIRED_PROFILE_FIELDS",
     "SCALAR_FIELDS",
@@ -65,6 +67,13 @@ LIST_FIELDS: Final[tuple[str, ...]] = ("directories", "required_files", "gitigno
 ALL_PROFILE_FIELDS: Final[frozenset[str]] = frozenset(SCALAR_FIELDS + LIST_FIELDS)
 REQUIRED_PROFILE_FIELDS: Final[frozenset[str]] = frozenset(LIST_FIELDS)
 OUTPUT_FORMATS: Final[tuple[str, ...]] = ("yaml", "json", "lines")
+
+# 프로필별로 CLI가 반드시 생성해야 하는 최상위 디렉토리 (YAML 편집으로 제거 불가).
+# handcrafted: 기준 모델 handcrafted-cpp — 도서는 contents/<도서명>/에 위치한다.
+# 이 목록 외의 디렉토리는 사용자가 `doctree layout add`로 명시적으로 추가하기 전까지 생성·삭제하지 않는다.
+MANDATORY_PROFILE_DIRECTORIES: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType({
+    "handcrafted": ("content_data", "contents", "practice", "scripts", "tips", ".opensource"),
+})
 
 
 def read_strict_yaml(path: PathLike) -> Any:
@@ -222,6 +231,16 @@ def _validate_single_profile(raw_profile: Any, profile_location: str) -> dict[st
     return clean_profile
 
 
+def _validate_mandatory_directories(profile_name: str, profile: Mapping[str, Any], location: str) -> None:
+    """MANDATORY_PROFILE_DIRECTORIES에 고정된 최상위 디렉토리가 프로필 directories에서 빠지지 않았는지 검증한다."""
+    mandatory = MANDATORY_PROFILE_DIRECTORIES.get(profile_name, ())
+    missing = [d for d in mandatory if d not in profile["directories"]]
+    if missing:
+        raise ClassificationError(
+            f"{location}.directories: {profile_name} 프로필의 필수 디렉토리는 제거할 수 없습니다: {', '.join(missing)}"
+        )
+
+
 def validate_layout_profiles(data: Any, location: str = "project_layout_profiles.yaml") -> dict[str, Any]:
     """레이아웃 프로필 YAML 문서를 검증하고 NFC 정규화된 사전을 반환한다."""
     root = validate_mapping_keys(
@@ -249,6 +268,7 @@ def validate_layout_profiles(data: Any, location: str = "project_layout_profiles
         )
         validate_unique_item(profile_name, seen_profiles, profile_location, duplicate_label="중복 프로필")
         normalized_profiles[profile_name] = _validate_single_profile(raw_profile, profile_location)
+        _validate_mandatory_directories(profile_name, normalized_profiles[profile_name], profile_location)
 
     return {
         "schema_version": 1,
